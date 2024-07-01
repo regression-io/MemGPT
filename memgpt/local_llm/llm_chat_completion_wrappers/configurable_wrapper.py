@@ -2,11 +2,10 @@ import json
 
 import yaml
 
-from .wrapper_base import LLMChatCompletionWrapper
 from ...constants import JSON_ENSURE_ASCII, JSON_LOADS_STRICT
-from ..json_parser import clean_json
-from ...constants import JSON_ENSURE_ASCII
 from ...errors import LLMJSONParsingError
+from ..json_parser import clean_json
+from .wrapper_base import LLMChatCompletionWrapper
 
 
 # A configurable model agnostic wrapper.
@@ -347,7 +346,7 @@ class ConfigurableJSONWrapper(LLMChatCompletionWrapper):
             "default_stop_sequences": self.default_stop_sequences,
         }
 
-        with open(file_path, "w") as yaml_file:
+        with open(file_path, "w", encoding="utf-8") as yaml_file:
             yaml.dump(data, yaml_file, default_flow_style=False)
 
     @staticmethod
@@ -358,7 +357,7 @@ class ConfigurableJSONWrapper(LLMChatCompletionWrapper):
         Args:
             file_path (str): The path to the YAML file.
         """
-        with open(file_path, "r") as yaml_file:
+        with open(file_path, "r", encoding="utf-8") as yaml_file:
             data = yaml.safe_load(yaml_file)
 
         wrapper = ConfigurableJSONWrapper()

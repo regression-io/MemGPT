@@ -2,7 +2,7 @@ import uuid
 from functools import partial
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, Body, HTTPException, status, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -42,6 +42,7 @@ class ArchivalMemoryObject(BaseModel):
 
 
 class GetAgentArchivalMemoryResponse(BaseModel):
+    # TODO: make this List[Passage] instead
     archival_memory: List[ArchivalMemoryObject] = Field(..., description="A list of all memory objects in archival memory.")
 
 

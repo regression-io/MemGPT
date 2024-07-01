@@ -1,22 +1,22 @@
 import os
-from sqlalchemy.ext.declarative import declarative_base
 import uuid
-import pytest
-
-from memgpt.agent_store.storage import StorageConnector, TableType
-from memgpt.embeddings import embedding_model, query_embedding
-from memgpt.data_types import Message, Passage, EmbeddingConfig, AgentState
-from memgpt.credentials import MemGPTCredentials
-from memgpt.agent_store.storage import StorageConnector, TableType
-from memgpt.metadata import MetadataStore
-from memgpt.data_types import User
-from memgpt.constants import MAX_EMBEDDING_DIM
-from memgpt.utils import get_human_text, get_persona_text
-
 from datetime import datetime, timedelta
 
-from tests import TEST_MEMGPT_CONFIG
+import pytest
+from sqlalchemy.ext.declarative import declarative_base
 
+from memgpt.agent_store.storage import StorageConnector, TableType
+from memgpt.config import MemGPTConfig
+from memgpt.constants import BASE_TOOLS, MAX_EMBEDDING_DIM
+from memgpt.credentials import MemGPTCredentials
+from memgpt.data_types import AgentState, Message, Passage, User
+from memgpt.embeddings import embedding_model, query_embedding
+from memgpt.metadata import MetadataStore
+from memgpt.settings import settings
+from tests import TEST_MEMGPT_CONFIG
+from tests.utils import create_config, wipe_config
+
+from .utils import with_qdrant_storage
 
 # Note: the database will filter out rows that do not correspond to agent1 and test_user by default.
 texts = ["This is a test passage", "This is another test passage", "Cinderella wept"]
@@ -102,7 +102,7 @@ def recreate_declarative_base():
     Base.metadata.clear()
 
 
-@pytest.mark.parametrize("storage_connector", ["postgres", "chroma", "sqlite"])
+@pytest.mark.parametrize("storage_connector", with_qdrant_storage(["postgres", "chroma", "sqlite", "milvus"]))
 # @pytest.mark.parametrize("storage_connector", ["sqlite", "chroma"])
 # @pytest.mark.parametrize("storage_connector", ["postgres"])
 @pytest.mark.parametrize("table_type", [TableType.RECALL_MEMORY, TableType.ARCHIVAL_MEMORY])
@@ -121,12 +121,23 @@ def test_storage(
     #        print("Removing messages", globals()['Message'])
     #        del globals()['Message']
 
+    wipe_config()
+    if os.getenv("OPENAI_API_KEY"):
+        create_config("openai")
+        credentials = MemGPTCredentials(
+            openai_key=os.getenv("OPENAI_API_KEY"),
+        )
+    else:  # hosted
+        create_config("memgpt_hosted")
+        MemGPTCredentials()
+
+    config = MemGPTConfig.load()
+    TEST_MEMGPT_CONFIG.default_embedding_config = config.default_embedding_config
+    TEST_MEMGPT_CONFIG.default_llm_config = config.default_llm_config
+
     if storage_connector == "postgres":
-        if not os.getenv("PGVECTOR_TEST_DB_URL"):
-            print("Skipping test, missing PG URI")
-            return
-        TEST_MEMGPT_CONFIG.archival_storage_uri = os.environ["PGVECTOR_TEST_DB_URL"]
-        TEST_MEMGPT_CONFIG.recall_storage_uri = os.environ["PGVECTOR_TEST_DB_URL"]
+        TEST_MEMGPT_CONFIG.archival_storage_uri = settings.memgpt_pg_uri
+        TEST_MEMGPT_CONFIG.recall_storage_uri = settings.memgpt_pg_uri
         TEST_MEMGPT_CONFIG.archival_storage_type = "postgres"
         TEST_MEMGPT_CONFIG.recall_storage_type = "postgres"
     if storage_connector == "lancedb":
@@ -149,23 +160,21 @@ def test_storage(
             print("Skipping test, sqlite only supported for recall memory")
             return
         TEST_MEMGPT_CONFIG.recall_storage_type = "sqlite"
-
+    if storage_connector == "qdrant":
+        if table_type == TableType.RECALL_MEMORY:
+            print("Skipping test, Qdrant only supports archival memory")
+            return
+        TEST_MEMGPT_CONFIG.archival_storage_type = "qdrant"
+        TEST_MEMGPT_CONFIG.archival_storage_uri = "localhost:6333"
+    if storage_connector == "milvus":
+        if table_type == TableType.RECALL_MEMORY:
+            print("Skipping test, Milvus only supports archival memory")
+            return
+        TEST_MEMGPT_CONFIG.archival_storage_type = "milvus"
+        TEST_MEMGPT_CONFIG.archival_storage_uri = "./milvus.db"
     # get embedding model
-    embed_model = None
-    if os.getenv("OPENAI_API_KEY"):
-        embedding_config = EmbeddingConfig(
-            embedding_endpoint_type="openai",
-            embedding_endpoint="https://api.openai.com/v1",
-            embedding_dim=1536,
-            # openai_key=os.getenv("OPENAI_API_KEY"),
-        )
-        credentials = MemGPTCredentials(
-            openai_key=os.getenv("OPENAI_API_KEY"),
-        )
-        credentials.save()
-    else:
-        embedding_config = EmbeddingConfig(embedding_endpoint_type="local", embedding_endpoint=None, embedding_dim=384)
-    embed_model = embedding_model(embedding_config)
+    embedding_config = TEST_MEMGPT_CONFIG.default_embedding_config
+    embed_model = embedding_model(TEST_MEMGPT_CONFIG.default_embedding_config)
 
     # create user
     ms = MetadataStore(TEST_MEMGPT_CONFIG)
@@ -175,13 +184,15 @@ def test_storage(
         user_id=user_id,
         name="agent_1",
         id=agent_1_id,
-        preset=TEST_MEMGPT_CONFIG.preset,
-        # persona_name=TEST_MEMGPT_CONFIG.persona,
-        # human_name=TEST_MEMGPT_CONFIG.human,
-        persona=get_persona_text(TEST_MEMGPT_CONFIG.persona),
-        human=get_human_text(TEST_MEMGPT_CONFIG.human),
         llm_config=TEST_MEMGPT_CONFIG.default_llm_config,
         embedding_config=TEST_MEMGPT_CONFIG.default_embedding_config,
+        system="",
+        tools=BASE_TOOLS,
+        state={
+            "persona": "",
+            "human": "",
+            "messages": None,
+        },
     )
     ms.create_user(user)
     ms.create_agent(agent)
@@ -216,7 +227,7 @@ def test_storage(
     conn.insert_many(records[1:])
     assert (
         conn.size() == 2
-    ), f"Expected 1 record, got {conn.size()}: {conn.get_all()}"  # expect 2, since storage connector filters for agent1
+    ), f"Expected 2 records, got {conn.size()}: {conn.get_all()}"  # expect 2, since storage connector filters for agent1
 
     # test: update
     # NOTE: only testing with messages

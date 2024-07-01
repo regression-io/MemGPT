@@ -3,16 +3,12 @@
 We originally tried to use Llama Index VectorIndex, but their limited API was extremely problematic.
 """
 
-from typing import Optional, List, Iterator, Union, Tuple, Type
 import uuid
 from abc import abstractmethod
-
-from typing import List, Optional, Dict
-from tqdm import tqdm
-
+from typing import Dict, Iterator, List, Optional, Tuple, Type, Union
 
 from memgpt.config import MemGPTConfig
-from memgpt.data_types import Record, Passage, Document, Message, Source, RecordType
+from memgpt.data_types import Document, Message, Passage, Record, RecordType
 from memgpt.utils import printd
 
 
@@ -104,6 +100,10 @@ class StorageConnector:
 
             return ChromaStorageConnector(table_type, config, user_id, agent_id)
 
+        elif storage_type == "qdrant":
+            from memgpt.agent_store.qdrant import QdrantStorageConnector
+
+            return QdrantStorageConnector(table_type, config, user_id, agent_id)
         # TODO: add back
         # elif storage_type == "lancedb":
         #    from memgpt.agent_store.db import LanceDBConnector
@@ -114,7 +114,10 @@ class StorageConnector:
             from memgpt.agent_store.db import SQLLiteStorageConnector
 
             return SQLLiteStorageConnector(table_type, config, user_id, agent_id)
+        elif storage_type == "milvus":
+            from memgpt.agent_store.milvus import MilvusStorageConnector
 
+            return MilvusStorageConnector(table_type, config, user_id, agent_id)
         else:
             raise NotImplementedError(f"Storage type {storage_type} not implemented")
 

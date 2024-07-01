@@ -1,6 +1,7 @@
 import json
-from .wrapper_base import LLMChatCompletionWrapper
+
 from ...constants import JSON_ENSURE_ASCII, JSON_LOADS_STRICT
+from .wrapper_base import LLMChatCompletionWrapper
 
 
 class SimpleSummaryWrapper(LLMChatCompletionWrapper):
@@ -107,8 +108,10 @@ class SimpleSummaryWrapper(LLMChatCompletionWrapper):
             elif message["role"] == "assistant":
                 prompt += f"\nASSISTANT: {message['content']}"
                 # need to add the function call if there was one
-                if message["function_call"]:
+                if "function_call" in message and message["function_call"]:
                     prompt += f"\n{create_function_call(message['function_call'])}"
+                elif "tool_calls" in message and message["tool_calls"]:
+                    prompt += f"\n{create_function_call(message['tool_calls'][0]['function'])}"
             elif message["role"] in ["function", "tool"]:
                 # TODO find a good way to add this
                 # prompt += f"\nASSISTANT: (function return) {message['content']}"

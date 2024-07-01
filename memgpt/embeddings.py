@@ -1,17 +1,8 @@
-import typer
-import uuid
-from typing import Optional, List, Any
 import os
+import uuid
+from typing import Any, List, Optional
+
 import numpy as np
-
-from memgpt.utils import is_valid_url, printd
-from memgpt.data_types import EmbeddingConfig
-from memgpt.credentials import MemGPTCredentials
-from memgpt.constants import MAX_EMBEDDING_DIM, EMBEDDING_TO_TOKENIZER_MAP, EMBEDDING_TO_TOKENIZER_DEFAULT
-
-# from llama_index.core.base.embeddings import BaseEmbedding
-from llama_index.core.node_parser import SentenceSplitter
-from llama_index.core import Document as LlamaIndexDocument
 
 # from llama_index.core.base.embeddings import BaseEmbedding
 # from llama_index.core.embeddings import BaseEmbedding
@@ -20,6 +11,19 @@ from llama_index.core import Document as LlamaIndexDocument
 # from llama_index.embeddings.base import BaseEmbedding
 # from llama_index.embeddings.huggingface_utils import format_text
 import tiktoken
+from llama_index.core import Document as LlamaIndexDocument
+
+# from llama_index.core.base.embeddings import BaseEmbedding
+from llama_index.core.node_parser import SentenceSplitter
+
+from memgpt.constants import (
+    EMBEDDING_TO_TOKENIZER_DEFAULT,
+    EMBEDDING_TO_TOKENIZER_MAP,
+    MAX_EMBEDDING_DIM,
+)
+from memgpt.credentials import MemGPTCredentials
+from memgpt.data_types import EmbeddingConfig
+from memgpt.utils import is_valid_url, printd
 
 
 def parse_and_chunk_text(text: str, chunk_size: int) -> List[str]:
@@ -158,7 +162,6 @@ def embedding_model(config: EmbeddingConfig, user_id: Optional[uuid.UUID] = None
     credentials = MemGPTCredentials.load()
 
     if endpoint_type == "openai":
-        assert credentials.openai_key is not None
         from llama_index.embeddings.openai import OpenAIEmbedding
 
         additional_kwargs = {"user_id": user_id} if user_id else {}
@@ -196,6 +199,20 @@ def embedding_model(config: EmbeddingConfig, user_id: Optional[uuid.UUID] = None
             base_url=config.embedding_endpoint,
             user=user_id,
         )
+    elif endpoint_type == "ollama":
+
+        from llama_index.embeddings.ollama import OllamaEmbedding
+
+        ollama_additional_kwargs = {}
+        callback_manager = None
+
+        model = OllamaEmbedding(
+            model_name=config.embedding_model,
+            base_url=config.embedding_endpoint,
+            ollama_additional_kwargs=ollama_additional_kwargs or {},
+            callback_manager=callback_manager or None,
+        )
+        return model
 
     else:
         return default_embedding_model()

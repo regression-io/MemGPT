@@ -1,29 +1,40 @@
-import os
 import base64
-from sqlalchemy import create_engine, Column, String, BIGINT, select, inspect, text, JSON, BLOB, BINARY, ARRAY, DateTime
-from sqlalchemy import func, or_, and_
-from sqlalchemy import desc, asc
-from sqlalchemy.orm import sessionmaker, mapped_column, declarative_base
+import os
+import uuid
+from datetime import datetime
+from typing import Dict, Iterator, List, Optional
+
+import numpy as np
+from sqlalchemy import (
+    BIGINT,
+    BINARY,
+    CHAR,
+    JSON,
+    Column,
+    DateTime,
+    String,
+    TypeDecorator,
+    and_,
+    asc,
+    create_engine,
+    desc,
+    func,
+    or_,
+    select,
+    text,
+)
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import declarative_base, mapped_column, sessionmaker
 from sqlalchemy.orm.session import close_all_sessions
 from sqlalchemy.sql import func
-from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy_json import mutable_json_type, MutableJson
-from sqlalchemy import TypeDecorator, CHAR
-import uuid
-
+from sqlalchemy_json import MutableJson
 from tqdm import tqdm
-from typing import Optional, List, Iterator, Dict
-import numpy as np
-from tqdm import tqdm
-import pandas as pd
 
-from memgpt.config import MemGPTConfig
 from memgpt.agent_store.storage import StorageConnector, TableType
 from memgpt.config import MemGPTConfig
-from memgpt.utils import printd
-from memgpt.data_types import Record, Message, Passage, ToolCall, RecordType
 from memgpt.constants import MAX_EMBEDDING_DIM
-from memgpt.metadata import MetadataStore
+from memgpt.data_types import Message, Passage, Record, RecordType, ToolCall
+from memgpt.settings import settings
 
 
 # Custom UUID type
@@ -151,7 +162,7 @@ def get_db_model(
             metadata_ = Column(MutableJson)
 
             # Add a datetime column, with default value as the current time
-            created_at = Column(DateTime(timezone=True), server_default=func.now())
+            created_at = Column(DateTime(timezone=True))
 
             def __repr__(self):
                 return f"<Passage(passage_id='{self.id}', text='{self.text}', embedding='{self.embedding})>"
@@ -217,7 +228,7 @@ def get_db_model(
             embedding_model = Column(String)
 
             # Add a datetime column, with default value as the current time
-            created_at = Column(DateTime(timezone=True), server_default=func.now())
+            created_at = Column(DateTime(timezone=True))
 
             def __repr__(self):
                 return f"<Message(message_id='{self.id}', text='{self.text}', embedding='{self.embedding})>"
@@ -369,7 +380,7 @@ class SQLStorageConnector(StorageConnector):
             unique_data_sources = session.query(self.db_model.data_source).filter(*self.filters).distinct().all()
         return unique_data_sources
 
-    def query_date(self, start_date, end_date, offset=0, limit=None):
+    def query_date(self, start_date, end_date, limit=None, offset=0):
         filters = self.get_filters({})
         with self.session_maker() as session:
             query = (
@@ -377,6 +388,8 @@ class SQLStorageConnector(StorageConnector):
                 .filter(*filters)
                 .filter(self.db_model.created_at >= start_date)
                 .filter(self.db_model.created_at <= end_date)
+                .filter(self.db_model.role != "system")
+                .filter(self.db_model.role != "tool")
                 .offset(offset)
             )
             if limit:
@@ -384,7 +397,7 @@ class SQLStorageConnector(StorageConnector):
             results = query.all()
         return [result.to_record() for result in results]
 
-    def query_text(self, query, offset=0, limit=None):
+    def query_text(self, query, limit=None, offset=0):
         # todo: make fuzz https://stackoverflow.com/questions/42388956/create-a-full-text-search-index-with-sqlalchemy-on-postgresql/42390204#42390204
         filters = self.get_filters({})
         with self.session_maker() as session:
@@ -392,6 +405,8 @@ class SQLStorageConnector(StorageConnector):
                 session.query(self.db_model)
                 .filter(*filters)
                 .filter(func.lower(self.db_model.text).contains(func.lower(query)))
+                .filter(self.db_model.role != "system")
+                .filter(self.db_model.role != "tool")
                 .offset(offset)
             )
             if limit:
@@ -424,29 +439,39 @@ class PostgresStorageConnector(SQLStorageConnector):
 
         super().__init__(table_type=table_type, config=config, user_id=user_id, agent_id=agent_id)
 
-        # get storage URI
-        if table_type == TableType.ARCHIVAL_MEMORY or table_type == TableType.PASSAGES:
-            self.uri = self.config.archival_storage_uri
-            if self.config.archival_storage_uri is None:
-                raise ValueError(f"Must specifiy archival_storage_uri in config {self.config.config_path}")
-        elif table_type == TableType.RECALL_MEMORY:
-            self.uri = self.config.recall_storage_uri
-            if self.config.recall_storage_uri is None:
-                raise ValueError(f"Must specifiy recall_storage_uri in config {self.config.config_path}")
-        else:
-            raise ValueError(f"Table type {table_type} not implemented")
         # create table
         self.db_model = get_db_model(config, self.table_name, table_type, user_id, agent_id)
+
+        # construct URI from enviornment variables
+        if settings.pg_uri:
+            self.uri = settings.pg_uri
+        else:
+            # use config URI
+            # TODO: remove this eventually (config should NOT contain URI)
+            if table_type == TableType.ARCHIVAL_MEMORY or table_type == TableType.PASSAGES:
+                self.uri = self.config.archival_storage_uri
+                if self.config.archival_storage_uri is None:
+                    raise ValueError(f"Must specifiy archival_storage_uri in config {self.config.config_path}")
+            elif table_type == TableType.RECALL_MEMORY:
+                self.uri = self.config.recall_storage_uri
+                if self.config.recall_storage_uri is None:
+                    raise ValueError(f"Must specifiy recall_storage_uri in config {self.config.config_path}")
+            else:
+                raise ValueError(f"Table type {table_type} not implemented")
+
+        # create engine
         self.engine = create_engine(self.uri)
+
         for c in self.db_model.__table__.columns:
             if c.name == "embedding":
                 assert isinstance(c.type, Vector), f"Embedding column must be of type Vector, got {c.type}"
 
-        Base.metadata.create_all(self.engine, tables=[self.db_model.__table__])  # Create the table if it doesn't exist
-
         self.session_maker = sessionmaker(bind=self.engine)
         with self.session_maker() as session:
             session.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))  # Enables the vector extension
+
+        # create table
+        Base.metadata.create_all(self.engine, tables=[self.db_model.__table__])  # Create the table if it doesn't exist
 
     def query(self, query: str, query_vec: List[float], top_k: int = 10, filters: Optional[Dict] = {}) -> List[RecordType]:
         filters = self.get_filters(filters)
@@ -468,9 +493,7 @@ class PostgresStorageConnector(SQLStorageConnector):
         if isinstance(records[0], Passage):
             with self.engine.connect() as conn:
                 db_records = [vars(record) for record in records]
-                # print("records", db_records)
                 stmt = insert(self.db_model.__table__).values(db_records)
-                # print(stmt)
                 if exists_ok:
                     upsert_stmt = stmt.on_conflict_do_update(
                         index_elements=["id"], set_={c.name: c for c in stmt.excluded}  # Replace with your primary key column
@@ -506,6 +529,30 @@ class PostgresStorageConnector(SQLStorageConnector):
 
             # Commit the changes to the database
             session.commit()
+
+    def str_to_datetime(self, str_date: str) -> datetime:
+        val = str_date.split("-")
+        _datetime = datetime(int(val[0]), int(val[1]), int(val[2]))
+        return _datetime
+
+    def query_date(self, start_date, end_date, limit=None, offset=0):
+        filters = self.get_filters({})
+        _start_date = self.str_to_datetime(start_date) if isinstance(start_date, str) else start_date
+        _end_date = self.str_to_datetime(end_date) if isinstance(end_date, str) else end_date
+        with self.session_maker() as session:
+            query = (
+                session.query(self.db_model)
+                .filter(*filters)
+                .filter(self.db_model.created_at >= _start_date)
+                .filter(self.db_model.created_at <= _end_date)
+                .filter(self.db_model.role != "system")
+                .filter(self.db_model.role != "tool")
+                .offset(offset)
+            )
+            if limit:
+                query = query.limit(limit)
+            results = query.all()
+        return [result.to_record() for result in results]
 
 
 class SQLLiteStorageConnector(SQLStorageConnector):
@@ -545,9 +592,7 @@ class SQLLiteStorageConnector(SQLStorageConnector):
         if isinstance(records[0], Passage):
             with self.engine.connect() as conn:
                 db_records = [vars(record) for record in records]
-                # print("records", db_records)
                 stmt = insert(self.db_model.__table__).values(db_records)
-                # print(stmt)
                 if exists_ok:
                     upsert_stmt = stmt.on_conflict_do_update(
                         index_elements=["id"], set_={c.name: c for c in stmt.excluded}  # Replace with your primary key column

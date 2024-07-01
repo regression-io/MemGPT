@@ -1,10 +1,14 @@
-from typing import Optional
 import datetime
 import json
 import math
+from typing import Optional
 
-from memgpt.constants import MAX_PAUSE_HEARTBEATS, RETRIEVAL_QUERY_DEFAULT_PAGE_SIZE, JSON_ENSURE_ASCII
 from memgpt.agent import Agent
+from memgpt.constants import (
+    JSON_ENSURE_ASCII,
+    MAX_PAUSE_HEARTBEATS,
+    RETRIEVAL_QUERY_DEFAULT_PAGE_SIZE,
+)
 
 ### Functions / tools the agent can use
 # All functions should return a response string (or None)
@@ -22,7 +26,7 @@ def send_message(self: Agent, message: str) -> Optional[str]:
         Optional[str]: None is always returned as this function does not produce a response.
     """
     # FIXME passing of msg_obj here is a hack, unclear if guaranteed to be the correct reference
-    self.interface.assistant_message(message, msg_obj=self._messages[-1])
+    self.interface.assistant_message(message)  # , msg_obj=self._messages[-1])
     return None
 
 
@@ -50,39 +54,6 @@ def pause_heartbeats(self: Agent, minutes: int) -> Optional[str]:
 
 
 pause_heartbeats.__doc__ = pause_heartbeats_docstring
-
-
-def core_memory_append(self: Agent, name: str, content: str) -> Optional[str]:
-    """
-    Append to the contents of core memory.
-
-    Args:
-        name (str): Section of the memory to be edited (persona or human).
-        content (str): Content to write to the memory. All unicode (including emojis) are supported.
-
-    Returns:
-        Optional[str]: None is always returned as this function does not produce a response.
-    """
-    self.memory.edit_append(name, content)
-    self.rebuild_memory()
-    return None
-
-
-def core_memory_replace(self: Agent, name: str, old_content: str, new_content: str) -> Optional[str]:
-    """
-    Replace the contents of core memory. To delete memories, use an empty string for new_content.
-
-    Args:
-        name (str): Section of the memory to be edited (persona or human).
-        old_content (str): String to replace. Must be an exact match.
-        new_content (str): Content to write to the memory. All unicode (including emojis) are supported.
-
-    Returns:
-        Optional[str]: None is always returned as this function does not produce a response.
-    """
-    self.memory.edit_replace(name, old_content, new_content)
-    self.rebuild_memory()
-    return None
 
 
 def conversation_search(self: Agent, query: str, page: Optional[int] = 0) -> Optional[str]:

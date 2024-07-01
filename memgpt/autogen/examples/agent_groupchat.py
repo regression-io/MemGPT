@@ -10,9 +10,11 @@ Begin by doing:
 """
 
 import os
+
 import autogen
-from memgpt.autogen.memgpt_agent import create_memgpt_autogen_agent_from_config, load_autogen_memgpt_agent
-from memgpt.constants import LLM_MAX_TOKENS, DEFAULT_PRESET
+
+from memgpt.autogen.memgpt_agent import create_memgpt_autogen_agent_from_config
+from memgpt.constants import DEFAULT_PRESET, LLM_MAX_TOKENS
 
 LLM_BACKEND = "openai"
 # LLM_BACKEND = "azure"
@@ -124,7 +126,8 @@ else:
 USE_MEMGPT = True
 
 # Set to True if you want to print MemGPT's inner workings.
-DEBUG = False
+# DEBUG = False
+DEBUG = True
 
 interface_kwargs = {
     "debug": DEBUG,

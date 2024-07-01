@@ -1,32 +1,45 @@
 import builtins
 import os
 import uuid
-from typing import Annotated, Optional
 from enum import Enum
-from typing import Annotated
+from typing import Annotated, Optional
 
 import questionary
 import typer
-from prettytable import PrettyTable, SINGLE_BORDER
 from prettytable.colortable import ColorTable, Themes
 from tqdm import tqdm
 
 from memgpt import utils
 from memgpt.agent_store.storage import StorageConnector, TableType
 from memgpt.config import MemGPTConfig
-from memgpt.constants import LLM_MAX_TOKENS
-from memgpt.constants import MEMGPT_DIR
-from memgpt.credentials import MemGPTCredentials, SUPPORTED_AUTH_TYPES
-from memgpt.data_types import User, LLMConfig, EmbeddingConfig
-from memgpt.llm_api_tools import openai_get_model_list, azure_openai_get_model_list, smart_urljoin
-from memgpt.local_llm.constants import DEFAULT_ENDPOINTS, DEFAULT_OLLAMA_MODEL, DEFAULT_WRAPPER_NAME
+from memgpt.constants import LLM_MAX_TOKENS, MEMGPT_DIR
+from memgpt.credentials import SUPPORTED_AUTH_TYPES, MemGPTCredentials
+from memgpt.data_types import EmbeddingConfig, LLMConfig, Source, User
+from memgpt.llm_api.anthropic import (
+    anthropic_get_model_list,
+    antropic_get_model_context_window,
+)
+from memgpt.llm_api.azure_openai import azure_openai_get_model_list
+from memgpt.llm_api.cohere import (
+    COHERE_VALID_MODEL_LIST,
+    cohere_get_model_context_window,
+    cohere_get_model_list,
+)
+from memgpt.llm_api.google_ai import (
+    google_ai_get_model_context_window,
+    google_ai_get_model_list,
+)
+from memgpt.llm_api.llm_api_tools import LLM_API_PROVIDER_OPTIONS
+from memgpt.llm_api.openai import openai_get_model_list
+from memgpt.local_llm.constants import (
+    DEFAULT_ENDPOINTS,
+    DEFAULT_OLLAMA_MODEL,
+    DEFAULT_WRAPPER_NAME,
+)
 from memgpt.local_llm.utils import get_available_wrappers
-from memgpt.server.utils import shorten_key_middle
-from memgpt.data_types import User, LLMConfig, EmbeddingConfig, Source
 from memgpt.metadata import MetadataStore
+from memgpt.models.pydantic_models import PersonaModel
 from memgpt.server.utils import shorten_key_middle
-from memgpt.models.pydantic_models import HumanModel, PersonaModel, PresetModel
-from memgpt.presets.presets import create_preset_from_file
 
 app = typer.Typer()
 
@@ -45,9 +58,14 @@ def get_azure_credentials():
     return creds
 
 
-def get_openai_credentials():
-    openai_key = os.getenv("OPENAI_API_KEY")
+def get_openai_credentials() -> Optional[str]:
+    openai_key = os.getenv("OPENAI_API_KEY", None)
     return openai_key
+
+
+def get_google_ai_credentials() -> Optional[str]:
+    google_ai_key = os.getenv("GOOGLE_AI_API_KEY", None)
+    return google_ai_key
 
 
 def configure_llm_endpoint(config: MemGPTConfig, credentials: MemGPTCredentials):
@@ -55,15 +73,18 @@ def configure_llm_endpoint(config: MemGPTConfig, credentials: MemGPTCredentials)
     model_endpoint_type, model_endpoint = None, None
 
     # get default
-    default_model_endpoint_type = config.default_llm_config.model_endpoint_type
-    if config.default_llm_config.model_endpoint_type is not None and config.default_llm_config.model_endpoint_type not in [
-        "openai",
-        "azure",
-    ]:  # local model
+    default_model_endpoint_type = config.default_llm_config.model_endpoint_type if config.default_embedding_config else None
+    if (
+        config.default_llm_config
+        and config.default_llm_config.model_endpoint_type is not None
+        and config.default_llm_config.model_endpoint_type not in [provider for provider in LLM_API_PROVIDER_OPTIONS if provider != "local"]
+    ):  # local model
         default_model_endpoint_type = "local"
 
     provider = questionary.select(
-        "Select LLM inference provider:", choices=["openai", "azure", "local"], default=default_model_endpoint_type
+        "Select LLM inference provider:",
+        choices=LLM_API_PROVIDER_OPTIONS,
+        default=default_model_endpoint_type,
     ).ask()
     if provider is None:
         raise KeyboardInterrupt
@@ -131,10 +152,135 @@ def configure_llm_endpoint(config: MemGPTConfig, credentials: MemGPTCredentials)
         model_endpoint_type = "azure"
         model_endpoint = azure_creds["azure_endpoint"]
 
+    elif provider == "google_ai":
+
+        # check for key
+        if credentials.google_ai_key is None:
+            # allow key to get pulled from env vars
+            google_ai_key = get_google_ai_credentials()
+            # if we still can't find it, ask for it as input
+            if google_ai_key is None:
+                while google_ai_key is None or len(google_ai_key) == 0:
+                    # Ask for API key as input
+                    google_ai_key = questionary.password(
+                        "Enter your Google AI (Gemini) API key (see https://aistudio.google.com/app/apikey):"
+                    ).ask()
+                    if google_ai_key is None:
+                        raise KeyboardInterrupt
+            credentials.google_ai_key = google_ai_key
+        else:
+            # Give the user an opportunity to overwrite the key
+            google_ai_key = None
+            default_input = shorten_key_middle(credentials.google_ai_key)
+
+            google_ai_key = questionary.password(
+                "Enter your Google AI (Gemini) API key (see https://aistudio.google.com/app/apikey):",
+                default=default_input,
+            ).ask()
+            if google_ai_key is None:
+                raise KeyboardInterrupt
+            # If the user modified it, use the new one
+            if google_ai_key != default_input:
+                credentials.google_ai_key = google_ai_key
+
+        default_input = os.getenv("GOOGLE_AI_SERVICE_ENDPOINT", None)
+        if default_input is None:
+            default_input = "generativelanguage"
+        google_ai_service_endpoint = questionary.text(
+            "Enter your Google AI (Gemini) service endpoint (see https://ai.google.dev/api/rest):",
+            default=default_input,
+        ).ask()
+        credentials.google_ai_service_endpoint = google_ai_service_endpoint
+
+        # write out the credentials
+        credentials.save()
+
+        model_endpoint_type = "google_ai"
+
+    elif provider == "anthropic":
+        # check for key
+        if credentials.anthropic_key is None:
+            # allow key to get pulled from env vars
+            anthropic_api_key = os.getenv("ANTHROPIC_API_KEY", None)
+            # if we still can't find it, ask for it as input
+            if anthropic_api_key is None:
+                while anthropic_api_key is None or len(anthropic_api_key) == 0:
+                    # Ask for API key as input
+                    anthropic_api_key = questionary.password(
+                        "Enter your Anthropic API key (starts with 'sk-', see https://console.anthropic.com/settings/keys):"
+                    ).ask()
+                    if anthropic_api_key is None:
+                        raise KeyboardInterrupt
+            credentials.anthropic_key = anthropic_api_key
+            credentials.save()
+        else:
+            # Give the user an opportunity to overwrite the key
+            anthropic_api_key = None
+            default_input = (
+                shorten_key_middle(credentials.anthropic_key) if credentials.anthropic_key.startswith("sk-") else credentials.anthropic_key
+            )
+            anthropic_api_key = questionary.password(
+                "Enter your Anthropic API key (starts with 'sk-', see https://console.anthropic.com/settings/keys):",
+                default=default_input,
+            ).ask()
+            if anthropic_api_key is None:
+                raise KeyboardInterrupt
+            # If the user modified it, use the new one
+            if anthropic_api_key != default_input:
+                credentials.anthropic_key = anthropic_api_key
+                credentials.save()
+
+        model_endpoint_type = "anthropic"
+        model_endpoint = "https://api.anthropic.com/v1"
+        model_endpoint = questionary.text("Override default endpoint:", default=model_endpoint).ask()
+        if model_endpoint is None:
+            raise KeyboardInterrupt
+        provider = "anthropic"
+
+    elif provider == "cohere":
+        # check for key
+        if credentials.cohere_key is None:
+            # allow key to get pulled from env vars
+            cohere_api_key = os.getenv("COHERE_API_KEY", None)
+            # if we still can't find it, ask for it as input
+            if cohere_api_key is None:
+                while cohere_api_key is None or len(cohere_api_key) == 0:
+                    # Ask for API key as input
+                    cohere_api_key = questionary.password("Enter your Cohere API key (see https://dashboard.cohere.com/api-keys):").ask()
+                    if cohere_api_key is None:
+                        raise KeyboardInterrupt
+            credentials.cohere_key = cohere_api_key
+            credentials.save()
+        else:
+            # Give the user an opportunity to overwrite the key
+            cohere_api_key = None
+            default_input = (
+                shorten_key_middle(credentials.cohere_key) if credentials.cohere_key.startswith("sk-") else credentials.cohere_key
+            )
+            cohere_api_key = questionary.password(
+                "Enter your Cohere API key (see https://dashboard.cohere.com/api-keys):",
+                default=default_input,
+            ).ask()
+            if cohere_api_key is None:
+                raise KeyboardInterrupt
+            # If the user modified it, use the new one
+            if cohere_api_key != default_input:
+                credentials.cohere_key = cohere_api_key
+                credentials.save()
+
+        model_endpoint_type = "cohere"
+        model_endpoint = "https://api.cohere.ai/v1"
+        model_endpoint = questionary.text("Override default endpoint:", default=model_endpoint).ask()
+        if model_endpoint is None:
+            raise KeyboardInterrupt
+        provider = "cohere"
+
     else:  # local models
-        backend_options = ["webui", "webui-legacy", "llamacpp", "koboldcpp", "ollama", "lmstudio", "lmstudio-legacy", "vllm", "openai"]
+        # backend_options_old = ["webui", "webui-legacy", "llamacpp", "koboldcpp", "ollama", "lmstudio", "lmstudio-legacy", "vllm", "openai"]
+        backend_options = builtins.list(DEFAULT_ENDPOINTS.keys())
+        # assert backend_options_old == backend_options, (backend_options_old, backend_options)
         default_model_endpoint_type = None
-        if config.default_llm_config.model_endpoint_type in backend_options:
+        if config.default_llm_config and config.default_llm_config.model_endpoint_type in backend_options:
             # set from previous config
             default_model_endpoint_type = config.default_llm_config.model_endpoint_type
         model_endpoint_type = questionary.select(
@@ -160,7 +306,7 @@ def configure_llm_endpoint(config: MemGPTConfig, credentials: MemGPTCredentials)
                     model_endpoint = questionary.text("Enter default endpoint:", default=default_model_endpoint).ask()
                     if model_endpoint is None:
                         raise KeyboardInterrupt
-            elif config.default_llm_config.model_endpoint:
+            elif config.default_llm_config and config.default_llm_config.model_endpoint:
                 model_endpoint = questionary.text("Enter default endpoint:", default=config.default_llm_config.model_endpoint).ask()
                 if model_endpoint is None:
                     raise KeyboardInterrupt
@@ -221,10 +367,41 @@ def get_model_options(
             else:
                 model_options = [obj["id"] for obj in fetched_model_options_response["data"]]
 
+        elif model_endpoint_type == "google_ai":
+            if credentials.google_ai_key is None:
+                raise ValueError("Missing Google AI API key")
+            if credentials.google_ai_service_endpoint is None:
+                raise ValueError("Missing Google AI service endpoint")
+            model_options = google_ai_get_model_list(
+                service_endpoint=credentials.google_ai_service_endpoint, api_key=credentials.google_ai_key
+            )
+            model_options = [str(m["name"]) for m in model_options]
+            model_options = [mo[len("models/") :] if mo.startswith("models/") else mo for mo in model_options]
+
+            # TODO remove manual filtering for gemini-pro
+            model_options = [mo for mo in model_options if str(mo).startswith("gemini") and "-pro" in str(mo)]
+            # model_options = ["gemini-pro"]
+
+        elif model_endpoint_type == "anthropic":
+            if credentials.anthropic_key is None:
+                raise ValueError("Missing Anthropic API key")
+            fetched_model_options = anthropic_get_model_list(url=model_endpoint, api_key=credentials.anthropic_key)
+            model_options = [obj["name"] for obj in fetched_model_options]
+
+        elif model_endpoint_type == "cohere":
+            if credentials.cohere_key is None:
+                raise ValueError("Missing Cohere API key")
+            fetched_model_options = cohere_get_model_list(url=model_endpoint, api_key=credentials.cohere_key)
+            model_options = [obj for obj in fetched_model_options]
+
         else:
             # Attempt to do OpenAI endpoint style model fetching
-            # TODO support local auth
-            fetched_model_options_response = openai_get_model_list(url=model_endpoint, api_key=None, fix_url=True)
+            # TODO support local auth with api-key header
+            if credentials.openllm_auth_type == "bearer_token":
+                api_key = credentials.openllm_key
+            else:
+                api_key = None
+            fetched_model_options_response = openai_get_model_list(url=model_endpoint, api_key=api_key, fix_url=True)
             model_options = [obj["id"] for obj in fetched_model_options_response["data"]]
             # NOTE no filtering of local model options
 
@@ -258,7 +435,7 @@ def configure_model(config: MemGPTConfig, credentials: MemGPTCredentials, model_
         other_option_str = "[enter model name manually]"
 
         # Check if the model we have set already is even in the list (informs our default)
-        valid_model = config.default_llm_config.model in hardcoded_model_options
+        valid_model = config.default_llm_config and config.default_llm_config.model in hardcoded_model_options
         model = questionary.select(
             "Select default model (recommended: gpt-4):",
             choices=hardcoded_model_options + [see_all_option_str, other_option_str],
@@ -272,6 +449,98 @@ def configure_model(config: MemGPTConfig, credentials: MemGPTCredentials, model_
             typer.secho(f"Warning: not all models shown are guaranteed to work with MemGPT", fg=typer.colors.RED)
             model = questionary.select(
                 "Select default model (recommended: gpt-4):",
+                choices=fetched_model_options + [other_option_str],
+                default=config.default_llm_config.model if (valid_model and config.default_llm_config) else fetched_model_options[0],
+            ).ask()
+            if model is None:
+                raise KeyboardInterrupt
+
+        # Finally if the user asked to manually input, allow it
+        if model == other_option_str:
+            model = ""
+            while len(model) == 0:
+                model = questionary.text(
+                    "Enter custom model name:",
+                ).ask()
+                if model is None:
+                    raise KeyboardInterrupt
+
+    elif model_endpoint_type == "google_ai":
+        try:
+            fetched_model_options = get_model_options(
+                credentials=credentials, model_endpoint_type=model_endpoint_type, model_endpoint=model_endpoint
+            )
+        except Exception as e:
+            # NOTE: if this fails, it means the user's key is probably bad
+            typer.secho(
+                f"Failed to get model list from {model_endpoint} - make sure your API key and endpoints are correct!", fg=typer.colors.RED
+            )
+            raise e
+
+        model = questionary.select(
+            "Select default model:",
+            choices=fetched_model_options,
+            default=fetched_model_options[0],
+        ).ask()
+        if model is None:
+            raise KeyboardInterrupt
+
+    elif model_endpoint_type == "anthropic":
+        try:
+            fetched_model_options = get_model_options(
+                credentials=credentials, model_endpoint_type=model_endpoint_type, model_endpoint=model_endpoint
+            )
+        except Exception as e:
+            # NOTE: if this fails, it means the user's key is probably bad
+            typer.secho(
+                f"Failed to get model list from {model_endpoint} - make sure your API key and endpoints are correct!", fg=typer.colors.RED
+            )
+            raise e
+
+        model = questionary.select(
+            "Select default model:",
+            choices=fetched_model_options,
+            default=fetched_model_options[0],
+        ).ask()
+        if model is None:
+            raise KeyboardInterrupt
+
+    elif model_endpoint_type == "cohere":
+
+        fetched_model_options = []
+        try:
+            fetched_model_options = get_model_options(
+                credentials=credentials, model_endpoint_type=model_endpoint_type, model_endpoint=model_endpoint
+            )
+        except Exception as e:
+            # NOTE: if this fails, it means the user's key is probably bad
+            typer.secho(
+                f"Failed to get model list from {model_endpoint} - make sure your API key and endpoints are correct!", fg=typer.colors.RED
+            )
+            raise e
+
+        fetched_model_options = [m["name"] for m in fetched_model_options]
+        hardcoded_model_options = [m for m in fetched_model_options if m in COHERE_VALID_MODEL_LIST]
+
+        # First ask if the user wants to see the full model list (some may be incompatible)
+        see_all_option_str = "[see all options]"
+        other_option_str = "[enter model name manually]"
+
+        # Check if the model we have set already is even in the list (informs our default)
+        valid_model = config.default_llm_config.model in hardcoded_model_options
+        model = questionary.select(
+            "Select default model (recommended: command-r-plus):",
+            choices=hardcoded_model_options + [see_all_option_str, other_option_str],
+            default=config.default_llm_config.model if valid_model else hardcoded_model_options[0],
+        ).ask()
+        if model is None:
+            raise KeyboardInterrupt
+
+        # If the user asked for the full list, show it
+        if model == see_all_option_str:
+            typer.secho(f"Warning: not all models shown are guaranteed to work with MemGPT", fg=typer.colors.RED)
+            model = questionary.select(
+                "Select default model (recommended: command-r-plus):",
                 choices=fetched_model_options + [other_option_str],
                 default=config.default_llm_config.model if valid_model else fetched_model_options[0],
             ).ask()
@@ -289,11 +558,49 @@ def configure_model(config: MemGPTConfig, credentials: MemGPTCredentials, model_
                     raise KeyboardInterrupt
 
     else:  # local models
+
+        # ask about local auth
+        if model_endpoint_type in ["groq"]:  # TODO all llm engines under 'local' that will require api keys
+            use_local_auth = True
+            local_auth_type = "bearer_token"
+            local_auth_key = questionary.password(
+                "Enter your Groq API key:",
+            ).ask()
+            if local_auth_key is None:
+                raise KeyboardInterrupt
+            credentials.openllm_auth_type = local_auth_type
+            credentials.openllm_key = local_auth_key
+            credentials.save()
+        else:
+            use_local_auth = questionary.confirm(
+                "Is your LLM endpoint authenticated? (default no)",
+                default=False,
+            ).ask()
+            if use_local_auth is None:
+                raise KeyboardInterrupt
+            if use_local_auth:
+                local_auth_type = questionary.select(
+                    "What HTTP authentication method does your endpoint require?",
+                    choices=SUPPORTED_AUTH_TYPES,
+                    default=SUPPORTED_AUTH_TYPES[0],
+                ).ask()
+                if local_auth_type is None:
+                    raise KeyboardInterrupt
+                local_auth_key = questionary.password(
+                    "Enter your authentication key:",
+                ).ask()
+                if local_auth_key is None:
+                    raise KeyboardInterrupt
+                # credentials = MemGPTCredentials.load()
+                credentials.openllm_auth_type = local_auth_type
+                credentials.openllm_key = local_auth_key
+                credentials.save()
+
         # ollama also needs model type
         if model_endpoint_type == "ollama":
             default_model = (
                 config.default_llm_config.model
-                if config.default_llm_config.model and config.default_llm_config.model_endpoint_type == "ollama"
+                if config.default_llm_config and config.default_llm_config.model_endpoint_type == "ollama"
                 else DEFAULT_OLLAMA_MODEL
             )
             model = questionary.text(
@@ -305,13 +612,11 @@ def configure_model(config: MemGPTConfig, credentials: MemGPTCredentials, model_
             model = None if len(model) == 0 else model
 
         default_model = (
-            config.default_llm_config.model
-            if config.default_llm_config.model and config.default_llm_config.model_endpoint_type == "vllm"
-            else ""
+            config.default_llm_config.model if config.default_llm_config and config.default_llm_config.model_endpoint_type == "vllm" else ""
         )
 
         # vllm needs huggingface model tag
-        if model_endpoint_type == "vllm":
+        if model_endpoint_type in ["vllm", "groq"]:
             try:
                 # Don't filter model list for vLLM since model list is likely much smaller than OpenAI/Azure endpoint
                 # + probably has custom model names
@@ -366,34 +671,9 @@ def configure_model(config: MemGPTConfig, credentials: MemGPTCredentials, model_
         if model_wrapper is None:
             raise KeyboardInterrupt
 
-        # ask about local auth
-        use_local_auth = questionary.confirm(
-            "Is your LLM endpoint authenticated? (default no)",
-            default=False,
-        ).ask()
-        if use_local_auth is None:
-            raise KeyboardInterrupt
-        if use_local_auth:
-            local_auth_type = questionary.select(
-                "What HTTP authentication method does your endpoint require?",
-                choices=SUPPORTED_AUTH_TYPES,
-                default=SUPPORTED_AUTH_TYPES[0],
-            ).ask()
-            if local_auth_type is None:
-                raise KeyboardInterrupt
-            local_auth_key = questionary.password(
-                "Enter your authentication key:",
-            ).ask()
-            if local_auth_key is None:
-                raise KeyboardInterrupt
-            # credentials = MemGPTCredentials.load()
-            credentials.openllm_auth_type = local_auth_type
-            credentials.openllm_key = local_auth_key
-            credentials.save()
-
     # set: context_window
     if str(model) not in LLM_MAX_TOKENS:
-        # Ask the user to specify the context length
+
         context_length_options = [
             str(2**12),  # 4096
             str(2**13),  # 8192
@@ -402,13 +682,82 @@ def configure_model(config: MemGPTConfig, credentials: MemGPTCredentials, model_
             str(2**18),  # 262144
             "custom",  # enter yourself
         ]
-        context_window_input = questionary.select(
-            "Select your model's context window (for Mistral 7B models, this is probably 8k / 8192):",
-            choices=context_length_options,
-            default=str(LLM_MAX_TOKENS["DEFAULT"]),
-        ).ask()
-        if context_window_input is None:
-            raise KeyboardInterrupt
+
+        if model_endpoint_type == "google_ai":
+            try:
+                fetched_context_window = str(
+                    google_ai_get_model_context_window(
+                        service_endpoint=credentials.google_ai_service_endpoint, api_key=credentials.google_ai_key, model=model
+                    )
+                )
+                print(f"Got context window {fetched_context_window} for model {model} (from Google API)")
+                context_length_options = [
+                    fetched_context_window,
+                    "custom",
+                ]
+            except Exception as e:
+                print(f"Failed to get model details for model '{model}' on Google AI API ({str(e)})")
+
+            context_window_input = questionary.select(
+                "Select your model's context window (see https://cloud.google.com/vertex-ai/generative-ai/docs/learn/model-versioning#gemini-model-versions):",
+                choices=context_length_options,
+                default=context_length_options[0],
+            ).ask()
+            if context_window_input is None:
+                raise KeyboardInterrupt
+
+        elif model_endpoint_type == "anthropic":
+            try:
+                fetched_context_window = str(
+                    antropic_get_model_context_window(url=model_endpoint, api_key=credentials.anthropic_key, model=model)
+                )
+                print(f"Got context window {fetched_context_window} for model {model}")
+                context_length_options = [
+                    fetched_context_window,
+                    "custom",
+                ]
+            except Exception as e:
+                print(f"Failed to get model details for model '{model}' ({str(e)})")
+
+            context_window_input = questionary.select(
+                "Select your model's context window (see https://docs.anthropic.com/claude/docs/models-overview):",
+                choices=context_length_options,
+                default=context_length_options[0],
+            ).ask()
+            if context_window_input is None:
+                raise KeyboardInterrupt
+
+        elif model_endpoint_type == "cohere":
+            try:
+                fetched_context_window = str(
+                    cohere_get_model_context_window(url=model_endpoint, api_key=credentials.cohere_key, model=model)
+                )
+                print(f"Got context window {fetched_context_window} for model {model}")
+                context_length_options = [
+                    fetched_context_window,
+                    "custom",
+                ]
+            except Exception as e:
+                print(f"Failed to get model details for model '{model}' ({str(e)})")
+
+            context_window_input = questionary.select(
+                "Select your model's context window (see https://docs.cohere.com/docs/command-r):",
+                choices=context_length_options,
+                default=context_length_options[0],
+            ).ask()
+            if context_window_input is None:
+                raise KeyboardInterrupt
+
+        else:
+
+            # Ask the user to specify the context length
+            context_window_input = questionary.select(
+                "Select your model's context window (for Mistral 7B models, this is probably 8k / 8192):",
+                choices=context_length_options,
+                default=str(LLM_MAX_TOKENS["DEFAULT"]),
+            ).ask()
+            if context_window_input is None:
+                raise KeyboardInterrupt
 
         # If custom, ask for input
         if context_window_input == "custom":
@@ -432,7 +781,7 @@ def configure_model(config: MemGPTConfig, credentials: MemGPTCredentials, model_
 def configure_embedding_endpoint(config: MemGPTConfig, credentials: MemGPTCredentials):
     # configure embedding endpoint
 
-    default_embedding_endpoint_type = config.default_embedding_config.embedding_endpoint_type
+    default_embedding_endpoint_type = config.default_embedding_config.embedding_endpoint_type if config.default_embedding_config else None
 
     embedding_endpoint_type, embedding_endpoint, embedding_dim, embedding_model = None, None, None, None
     embedding_provider = questionary.select(
@@ -498,7 +847,7 @@ def configure_embedding_endpoint(config: MemGPTConfig, credentials: MemGPTCreden
 
         # get model type
         default_embedding_model = (
-            config.default_embedding_config.embedding_model if config.default_embedding_config.embedding_model else "BAAI/bge-large-en-v1.5"
+            config.default_embedding_config.embedding_model if config.default_embedding_config else "BAAI/bge-large-en-v1.5"
         )
         embedding_model = questionary.text(
             "Enter HuggingFace model tag (e.g. BAAI/bge-large-en-v1.5):",
@@ -508,8 +857,44 @@ def configure_embedding_endpoint(config: MemGPTConfig, credentials: MemGPTCreden
             raise KeyboardInterrupt
 
         # get model dimentions
-        default_embedding_dim = config.default_embedding_config.embedding_dim if config.default_embedding_config.embedding_dim else "1024"
+        default_embedding_dim = config.default_embedding_config.embedding_dim if config.default_embedding_config else "1024"
         embedding_dim = questionary.text("Enter embedding model dimentions (e.g. 1024):", default=str(default_embedding_dim)).ask()
+        if embedding_dim is None:
+            raise KeyboardInterrupt
+        try:
+            embedding_dim = int(embedding_dim)
+        except Exception:
+            raise ValueError(f"Failed to cast {embedding_dim} to integer.")
+    elif embedding_provider == "ollama":
+        # configure ollama embedding endpoint
+        embedding_endpoint_type = "ollama"
+        embedding_endpoint = "http://localhost:11434/api/embeddings"
+        # Source: https://github.com/ollama/ollama/blob/main/docs/api.md#generate-embeddings:~:text=http%3A//localhost%3A11434/api/embeddings
+
+        # get endpoint (is this necessary?)
+        embedding_endpoint = questionary.text("Enter Ollama API endpoint:").ask()
+        if embedding_endpoint is None:
+            raise KeyboardInterrupt
+        while not utils.is_valid_url(embedding_endpoint):
+            typer.secho(f"Endpoint must be a valid address", fg=typer.colors.YELLOW)
+            embedding_endpoint = questionary.text("Enter Ollama API endpoint:").ask()
+            if embedding_endpoint is None:
+                raise KeyboardInterrupt
+
+        # get model type
+        default_embedding_model = (
+            config.default_embedding_config.embedding_model if config.default_embedding_config else "mxbai-embed-large"
+        )
+        embedding_model = questionary.text(
+            "Enter Ollama model tag (e.g. mxbai-embed-large):",
+            default=default_embedding_model,
+        ).ask()
+        if embedding_model is None:
+            raise KeyboardInterrupt
+
+        # get model dimensions
+        default_embedding_dim = config.default_embedding_config.embedding_dim if config.default_embedding_config else "512"
+        embedding_dim = questionary.text("Enter embedding model dimensions (e.g. 512):", default=str(default_embedding_dim)).ask()
         if embedding_dim is None:
             raise KeyboardInterrupt
         try:
@@ -519,44 +904,15 @@ def configure_embedding_endpoint(config: MemGPTConfig, credentials: MemGPTCreden
     else:  # local models
         embedding_endpoint_type = "local"
         embedding_endpoint = None
+        embedding_model = "BAAI/bge-small-en-v1.5"
         embedding_dim = 384
 
     return embedding_endpoint_type, embedding_endpoint, embedding_dim, embedding_model
 
 
-def configure_cli(config: MemGPTConfig, credentials: MemGPTCredentials):
-    # set: preset, default_persona, default_human, default_agent``
-    from memgpt.presets.presets import preset_options
-
-    # preset
-    default_preset = config.preset if config.preset and config.preset in preset_options else None
-    preset = questionary.select("Select default preset:", preset_options, default=default_preset).ask()
-    if preset is None:
-        raise KeyboardInterrupt
-
-    # persona
-    personas = [os.path.basename(f).replace(".txt", "") for f in utils.list_persona_files()]
-    default_persona = config.persona if config.persona and config.persona in personas else None
-    persona = questionary.select("Select default persona:", personas, default=default_persona).ask()
-    if persona is None:
-        raise KeyboardInterrupt
-
-    # human
-    humans = [os.path.basename(f).replace(".txt", "") for f in utils.list_human_files()]
-    default_human = config.human if config.human and config.human in humans else None
-    human = questionary.select("Select default human:", humans, default=default_human).ask()
-    if human is None:
-        raise KeyboardInterrupt
-
-    # TODO: figure out if we should set a default agent or not
-    agent = None
-
-    return preset, persona, human, agent
-
-
 def configure_archival_storage(config: MemGPTConfig, credentials: MemGPTCredentials):
     # Configure archival storage backend
-    archival_storage_options = ["postgres", "chroma"]
+    archival_storage_options = ["postgres", "chroma", "milvus", "qdrant"]
     archival_storage_type = questionary.select(
         "Select storage backend for archival data:", archival_storage_options, default=config.archival_storage_type
     ).ask()
@@ -593,6 +949,26 @@ def configure_archival_storage(config: MemGPTConfig, credentials: MemGPTCredenti
         if chroma_type == "persistent":
             archival_storage_path = os.path.join(MEMGPT_DIR, "chroma")
 
+    if archival_storage_type == "qdrant":
+        qdrant_type = questionary.select("Select Qdrant backend:", ["local", "server"], default="local").ask()
+        if qdrant_type is None:
+            raise KeyboardInterrupt
+        if qdrant_type == "server":
+            archival_storage_uri = questionary.text(
+                "Enter the Qdrant instance URI (Default: localhost:6333):", default="localhost:6333"
+            ).ask()
+            if archival_storage_uri is None:
+                raise KeyboardInterrupt
+        if qdrant_type == "local":
+            archival_storage_path = os.path.join(MEMGPT_DIR, "qdrant")
+
+    if archival_storage_type == "milvus":
+        default_milvus_uri = archival_storage_path = os.path.join(MEMGPT_DIR, "milvus.db")
+        archival_storage_uri = questionary.text(
+            f"Enter the Milvus connection URI (Default: {default_milvus_uri}):", default=default_milvus_uri
+        ).ask()
+        if archival_storage_uri is None:
+            raise KeyboardInterrupt
     return archival_storage_type, archival_storage_uri, archival_storage_path
 
     # TODO: allow configuring embedding model
@@ -649,10 +1025,6 @@ def configure():
             config=config,
             credentials=credentials,
         )
-        default_preset, default_persona, default_human, default_agent = configure_cli(
-            config=config,
-            credentials=credentials,
-        )
         archival_storage_type, archival_storage_uri, archival_storage_path = configure_archival_storage(
             config=config,
             credentials=credentials,
@@ -683,10 +1055,6 @@ def configure():
             embedding_dim=embedding_dim,
             embedding_model=embedding_model,
         ),
-        # cli configs
-        preset=default_preset,
-        persona=default_persona,
-        human=default_human,
         # storage
         archival_storage_type=archival_storage_type,
         archival_storage_uri=archival_storage_uri,
@@ -709,7 +1077,6 @@ def configure():
     user_id = uuid.UUID(config.anon_clientid)
     user = User(
         id=uuid.UUID(config.anon_clientid),
-        default_agent=default_agent,
     )
     if ms.get_user(user_id):
         # update user
@@ -717,25 +1084,22 @@ def configure():
     else:
         ms.create_user(user)
 
-    # create preset records in metadata store
-    from memgpt.presets.presets import add_default_presets
-
-    add_default_presets(user_id, ms)
-
 
 class ListChoice(str, Enum):
     agents = "agents"
     humans = "humans"
     personas = "personas"
     sources = "sources"
-    presets = "presets"
 
 
 @app.command()
 def list(arg: Annotated[ListChoice, typer.Argument]):
+    from memgpt.client.client import create_client
+
     config = MemGPTConfig.load()
     ms = MetadataStore(config)
     user_id = uuid.UUID(config.anon_clientid)
+    client = create_client(base_url=os.getenv("MEMGPT_BASE_URL"), token=os.getenv("MEMGPT_SERVER_PASS"))
     table = ColorTable(theme=Themes.OCEAN)
     if arg == ListChoice.agents:
         """List all agents"""
@@ -762,7 +1126,7 @@ def list(arg: Annotated[ListChoice, typer.Argument]):
     elif arg == ListChoice.humans:
         """List all humans"""
         table.field_names = ["Name", "Text"]
-        for human in ms.list_humans(user_id=user_id):
+        for human in client.list_humans():
             table.add_row([human.name, human.text.replace("\n", "")[:100]])
         print(table)
     elif arg == ListChoice.personas:
@@ -799,21 +1163,6 @@ def list(arg: Annotated[ListChoice, typer.Argument]):
             )
 
         print(table)
-    elif arg == ListChoice.presets:
-        """List all available presets"""
-        table.field_names = ["Name", "Description", "Sources", "Functions"]
-        for preset in ms.list_presets(user_id=user_id):
-            sources = ms.get_preset_sources(preset_id=preset.id)
-            table.add_row(
-                [
-                    preset.name,
-                    preset.description,
-                    ",".join([source.name for source in sources]),
-                    # json.dumps(preset.functions_schema, indent=4)
-                    ",\n".join([f["name"] for f in preset.functions_schema]),
-                ]
-            )
-        print(table)
     else:
         raise ValueError(f"Unknown argument {arg}")
 
@@ -826,20 +1175,38 @@ def add(
     filename: Annotated[Optional[str], typer.Option("-f", help="Specify filename")] = None,
 ):
     """Add a person/human"""
+    from memgpt.client.client import create_client
+
     config = MemGPTConfig.load()
     user_id = uuid.UUID(config.anon_clientid)
     ms = MetadataStore(config)
+    client = create_client(base_url=os.getenv("MEMGPT_BASE_URL"), token=os.getenv("MEMGPT_SERVER_PASS"))
     if filename:  # read from file
         assert text is None, "Cannot specify both text and filename"
-        with open(filename, "r") as f:
+        with open(filename, "r", encoding="utf-8") as f:
             text = f.read()
     if option == "persona":
-        ms.add_persona(PersonaModel(name=name, text=text, user_id=user_id))
+        persona = ms.get_persona(name=name)
+        if persona:
+            # config if user wants to overwrite
+            if not questionary.confirm(f"Persona {name} already exists. Overwrite?").ask():
+                return
+            persona.text = text
+            ms.update_persona(persona)
+        else:
+            persona = PersonaModel(name=name, text=text, user_id=user_id)
+            ms.add_persona(persona)
+
     elif option == "human":
-        ms.add_human(HumanModel(name=name, text=text, user_id=user_id))
-    elif option == "preset":
-        assert filename, "Must specify filename for preset"
-        create_preset_from_file(filename, name, user_id, ms)
+        human = client.get_human(name=name)
+        if human:
+            # config if user wants to overwrite
+            if not questionary.confirm(f"Human {name} already exists. Overwrite?").ask():
+                return
+            human.text = text
+            client.update_human(human)
+        else:
+            human = client.create_human(name=name, human=text)
     else:
         raise ValueError(f"Unknown kind {option}")
 
@@ -847,9 +1214,11 @@ def add(
 @app.command()
 def delete(option: str, name: str):
     """Delete a source from the archival memory."""
+    from memgpt.client.client import create_client
 
     config = MemGPTConfig.load()
     user_id = uuid.UUID(config.anon_clientid)
+    client = create_client(base_url=os.getenv("MEMGPT_BASE_URL"), token=os.getenv("MEMGPT_API_KEY"))
     ms = MetadataStore(config)
     assert ms.get_user(user_id=user_id), f"User {user_id} does not exist"
 
@@ -886,15 +1255,18 @@ def delete(option: str, name: str):
             ms.delete_agent(agent_id=agent.id)
 
         elif option == "human":
-            ms.delete_human(name=name, user_id=user_id)
+            human = client.get_human(name=name)
+            assert human is not None, f"Human {name} does not exist"
+            client.delete_human(name=name)
         elif option == "persona":
-            ms.delete_persona(name=name, user_id=user_id)
-        elif option == "preset":
-            ms.delete_preset(name=name, user_id=user_id)
+            persona = ms.get_persona(name=name)
+            assert persona is not None, f"Persona {name} does not exist"
+            ms.delete_persona(name=name)
+            assert ms.get_persona(name=name) is None, f"Persona {name} still exists"
         else:
             raise ValueError(f"Option {option} not implemented")
 
-        typer.secho(f"Deleted source '{name}'", fg=typer.colors.GREEN)
+        typer.secho(f"Deleted {option} '{name}'", fg=typer.colors.GREEN)
 
     except Exception as e:
-        typer.secho(f"Failed to deleted source '{name}'\n{e}", fg=typer.colors.RED)
+        typer.secho(f"Failed to delete {option}'{name}'\n{e}", fg=typer.colors.RED)

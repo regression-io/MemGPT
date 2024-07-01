@@ -1,20 +1,10 @@
-from memgpt.log import logger
+import configparser
 import os
 from dataclasses import dataclass
-import configparser
-import typer
-import questionary
 from typing import Optional
 
-import memgpt
-import memgpt.utils as utils
-from memgpt.utils import printd, get_schema_diff
-from memgpt.functions.functions import load_all_function_sets
-
-from memgpt.constants import MEMGPT_DIR, LLM_MAX_TOKENS, DEFAULT_HUMAN, DEFAULT_PERSONA, DEFAULT_PRESET
-from memgpt.data_types import AgentState, User, LLMConfig, EmbeddingConfig
 from memgpt.config import get_field, set_field
-
+from memgpt.constants import MEMGPT_DIR
 
 SUPPORTED_AUTH_TYPES = ["bearer_token", "api_key"]
 
@@ -26,7 +16,17 @@ class MemGPTCredentials:
 
     # openai config
     openai_auth_type: str = "bearer_token"
-    openai_key: Optional[str] = None
+    openai_key: Optional[str] = os.getenv("OPENAI_API_KEY")
+
+    # gemini config
+    google_ai_key: Optional[str] = None
+    google_ai_service_endpoint: Optional[str] = None
+
+    # anthropic config
+    anthropic_key: Optional[str] = None
+
+    # cohere config
+    cohere_key: Optional[str] = None
 
     # azure config
     azure_auth_type: str = "api_key"
@@ -70,6 +70,13 @@ class MemGPTCredentials:
                 "azure_embedding_version": get_field(config, "azure", "embedding_version"),
                 "azure_embedding_endpoint": get_field(config, "azure", "embedding_endpoint"),
                 "azure_embedding_deployment": get_field(config, "azure", "embedding_deployment"),
+                # gemini
+                "google_ai_key": get_field(config, "google_ai", "key"),
+                "google_ai_service_endpoint": get_field(config, "google_ai", "service_endpoint"),
+                # anthropic
+                "anthropic_key": get_field(config, "anthropic", "key"),
+                # cohere
+                "cohere_key": get_field(config, "cohere", "key"),
                 # open llm
                 "openllm_auth_type": get_field(config, "openllm", "auth_type"),
                 "openllm_key": get_field(config, "openllm", "key"),
@@ -85,7 +92,7 @@ class MemGPTCredentials:
         return config
 
     def save(self):
-        import memgpt
+        pass
 
         config = configparser.ConfigParser()
         # openai config
@@ -102,7 +109,17 @@ class MemGPTCredentials:
         set_field(config, "azure", "embedding_endpoint", self.azure_embedding_endpoint)
         set_field(config, "azure", "embedding_deployment", self.azure_embedding_deployment)
 
-        # openai config
+        # gemini
+        set_field(config, "google_ai", "key", self.google_ai_key)
+        set_field(config, "google_ai", "service_endpoint", self.google_ai_service_endpoint)
+
+        # anthropic
+        set_field(config, "anthropic", "key", self.anthropic_key)
+
+        # cohere
+        set_field(config, "cohere", "key", self.cohere_key)
+
+        # openllm config
         set_field(config, "openllm", "auth_type", self.openllm_auth_type)
         set_field(config, "openllm", "key", self.openllm_key)
 

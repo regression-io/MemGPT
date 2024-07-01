@@ -1,30 +1,48 @@
 """ Metadata store for user/agent/data_source information"""
 
 import os
-import inspect as python_inspect
-import uuid
 import secrets
-from typing import Optional, List
+import traceback
+import uuid
+from typing import List, Optional
 
-from memgpt.constants import DEFAULT_HUMAN, DEFAULT_MEMGPT_MODEL, DEFAULT_PERSONA, DEFAULT_PRESET, LLM_MAX_TOKENS
-from memgpt.utils import get_local_time, enforce_types
-from memgpt.data_types import AgentState, Source, User, LLMConfig, EmbeddingConfig, Token, Preset
-from memgpt.config import MemGPTConfig
-from memgpt.functions.functions import load_all_function_sets
-
-from memgpt.models.pydantic_models import PersonaModel, HumanModel, ToolModel
-
-from sqlalchemy import create_engine, Column, String, BIGINT, select, inspect, text, JSON, BLOB, BINARY, ARRAY, Boolean
-from sqlalchemy import func
-from sqlalchemy.orm import sessionmaker, mapped_column, declarative_base
-from sqlalchemy.orm.session import close_all_sessions
+from sqlalchemy import (
+    BIGINT,
+    CHAR,
+    JSON,
+    Boolean,
+    Column,
+    DateTime,
+    String,
+    TypeDecorator,
+    create_engine,
+    desc,
+    func,
+)
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.exc import InterfaceError, OperationalError
+from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.sql import func
-from sqlalchemy import Column, BIGINT, String, DateTime
-from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy_json import mutable_json_type, MutableJson
-from sqlalchemy import TypeDecorator, CHAR
-from sqlalchemy.orm import sessionmaker, mapped_column, declarative_base
 
+from memgpt.config import MemGPTConfig
+from memgpt.data_types import (
+    AgentState,
+    EmbeddingConfig,
+    LLMConfig,
+    Preset,
+    Source,
+    Token,
+    User,
+)
+from memgpt.models.pydantic_models import (
+    HumanModel,
+    JobModel,
+    JobStatus,
+    PersonaModel,
+    ToolModel,
+)
+from memgpt.settings import settings
+from memgpt.utils import enforce_types, get_utc_time, printd
 
 Base = declarative_base()
 
@@ -68,7 +86,6 @@ class LLMConfigColumn(TypeDecorator):
         return value
 
     def process_result_value(self, value, dialect):
-        # print("GET VALUE", value)
         if value:
             return LLMConfig(**value)
         return value
@@ -158,9 +175,7 @@ class AgentModel(Base):
     id = Column(CommonUUID, primary_key=True, default=uuid.uuid4)
     user_id = Column(CommonUUID, nullable=False)
     name = Column(String, nullable=False)
-    persona = Column(String)
-    human = Column(String)
-    preset = Column(String)
+    system = Column(String)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     # configs
@@ -169,6 +184,10 @@ class AgentModel(Base):
 
     # state
     state = Column(JSON)
+    _metadata = Column(JSON)
+
+    # tools
+    tools = Column(JSON)
 
     def __repr__(self) -> str:
         return f"<Agent(id='{self.id}', name='{self.name}')>"
@@ -178,13 +197,13 @@ class AgentModel(Base):
             id=self.id,
             user_id=self.user_id,
             name=self.name,
-            persona=self.persona,
-            human=self.human,
-            preset=self.preset,
             created_at=self.created_at,
             llm_config=self.llm_config,
             embedding_config=self.embedding_config,
             state=self.state,
+            tools=self.tools,
+            system=self.system,
+            _metadata=self._metadata,
         )
 
 
@@ -301,10 +320,14 @@ class PresetModel(Base):
 
 
 class MetadataStore:
+    uri: Optional[str] = None
+
     def __init__(self, config: MemGPTConfig):
         # TODO: get DB URI or path
         if config.metadata_storage_type == "postgres":
-            self.uri = config.metadata_storage_uri
+            # construct URI from enviornment variables
+            self.uri = settings.pg_uri if settings.pg_uri else config.metadata_storage_uri
+
         elif config.metadata_storage_type == "sqlite":
             path = os.path.join(config.metadata_storage_path, "sqlite.db")
             self.uri = f"sqlite:///{path}"
@@ -312,25 +335,45 @@ class MetadataStore:
             raise ValueError(f"Invalid metadata storage type: {config.metadata_storage_type}")
 
         # Ensure valid URI
-        if not self.uri:
-            raise ValueError("Database URI is not provided or is invalid.")
+        assert self.uri, "Database URI is not provided or is invalid."
 
         # Check if tables need to be created
         self.engine = create_engine(self.uri)
-        Base.metadata.create_all(
-            self.engine,
-            tables=[
-                UserModel.__table__,
-                AgentModel.__table__,
-                SourceModel.__table__,
-                AgentSourceMappingModel.__table__,
-                TokenModel.__table__,
-                PresetModel.__table__,
-                PresetSourceMapping.__table__,
-                HumanModel.__table__,
-                PersonaModel.__table__,
-            ],
-        )
+        try:
+            Base.metadata.create_all(
+                self.engine,
+                tables=[
+                    UserModel.__table__,
+                    AgentModel.__table__,
+                    SourceModel.__table__,
+                    AgentSourceMappingModel.__table__,
+                    TokenModel.__table__,
+                    PresetModel.__table__,
+                    PresetSourceMapping.__table__,
+                    HumanModel.__table__,
+                    PersonaModel.__table__,
+                    ToolModel.__table__,
+                    JobModel.__table__,
+                ],
+            )
+        except (InterfaceError, OperationalError) as e:
+            traceback.print_exc()
+            if config.metadata_storage_type == "postgres":
+                raise ValueError(
+                    f"{str(e)}\n\nMemGPT failed to connect to the database at URI '{self.uri}'. "
+                    + "Please make sure you configured your storage backend correctly (https://memgpt.readme.io/docs/storage). "
+                    + "\npostgres detected: Make sure the postgres database is running (https://memgpt.readme.io/docs/storage#postgres)."
+                )
+            elif config.metadata_storage_type == "sqlite":
+                raise ValueError(
+                    f"{str(e)}\n\nMemGPT failed to connect to the database at URI '{self.uri}'. "
+                    + "Please make sure you configured your storage backend correctly (https://memgpt.readme.io/docs/storage). "
+                    + "\nsqlite detected: Make sure that the sqlite.db file exists at the URI."
+                )
+            else:
+                raise e
+        except:
+            raise
         self.session_maker = sessionmaker(bind=self.engine)
 
     @enforce_types
@@ -367,14 +410,15 @@ class MetadataStore:
     def get_all_api_keys_for_user(self, user_id: uuid.UUID) -> List[Token]:
         with self.session_maker() as session:
             results = session.query(TokenModel).filter(TokenModel.user_id == user_id).all()
-            return [r.to_record() for r in results]
+            tokens = [r.to_record() for r in results]
+            return tokens
 
     @enforce_types
     def get_user_from_api_key(self, api_key: str) -> Optional[User]:
         """Get the user associated with a given API key"""
         token = self.get_api_key(api_key=api_key)
         if token is None:
-            raise ValueError(f"Token {api_key} does not exist")
+            raise ValueError(f"Provided token does not exist")
         else:
             return self.get_user(user_id=token.user_id)
 
@@ -382,6 +426,8 @@ class MetadataStore:
     def create_agent(self, agent: AgentState):
         # insert into agent table
         # make sure agent.name does not already exist for user user_id
+        assert agent.state is not None, "Agent state must be provided"
+        assert len(list(agent.state.keys())) > 0, "Agent state must not be empty"
         with self.session_maker() as session:
             if session.query(AgentModel).filter(AgentModel.name == agent.name).filter(AgentModel.user_id == agent.user_id).count() > 0:
                 raise ValueError(f"Agent with name {agent.name} already exists")
@@ -486,9 +532,36 @@ class MetadataStore:
             session.commit()
 
     @enforce_types
+    def update_human(self, human: HumanModel):
+        with self.session_maker() as session:
+            session.add(human)
+            session.commit()
+            session.refresh(human)
+
+    @enforce_types
+    def update_persona(self, persona: PersonaModel):
+        with self.session_maker() as session:
+            session.add(persona)
+            session.commit()
+            session.refresh(persona)
+
+    @enforce_types
+    def update_tool(self, tool: ToolModel):
+        with self.session_maker() as session:
+            session.add(tool)
+            session.commit()
+            session.refresh(tool)
+
+    @enforce_types
     def delete_agent(self, agent_id: uuid.UUID):
         with self.session_maker() as session:
+
+            # delete agents
             session.query(AgentModel).filter(AgentModel.id == agent_id).delete()
+
+            # delete mappings
+            session.query(AgentSourceMappingModel).filter(AgentSourceMappingModel.agent_id == agent_id).delete()
+
             session.commit()
 
     @enforce_types
@@ -526,24 +599,13 @@ class MetadataStore:
             return [r.to_record() for r in results]
 
     @enforce_types
-    def list_tools(self, user_id: uuid.UUID) -> List[ToolModel]:
+    # def list_tools(self, user_id: uuid.UUID) -> List[ToolModel]: # TODO: add when users can creat tools
+    def list_tools(self, user_id: Optional[uuid.UUID] = None) -> List[ToolModel]:
         with self.session_maker() as session:
-            available_functions = load_all_function_sets()
-            print(available_functions)
-            results = [
-                ToolModel(
-                    name=k,
-                    json_schema=v["json_schema"],
-                    tags=v["tags"],
-                    source_type="python",
-                    source_code=python_inspect.getsource(v["python_function"]),
-                )
-                for k, v in available_functions.items()
-            ]
-            print(results)
+            results = session.query(ToolModel).filter(ToolModel.user_id == None).all()
+            if user_id:
+                results += session.query(ToolModel).filter(ToolModel.user_id == user_id).all()
             return results
-            # results = session.query(PresetModel).filter(PresetModel.user_id == user_id).all()
-            # return [r.to_record() for r in results]
 
     @enforce_types
     def list_agents(self, user_id: uuid.UUID) -> List[AgentState]:
@@ -583,11 +645,19 @@ class MetadataStore:
             return results[0].to_record()
 
     @enforce_types
-    def get_all_users(self) -> List[User]:
-        # TODO make paginated
+    def get_all_users(self, cursor: Optional[uuid.UUID] = None, limit: Optional[int] = 50) -> (Optional[uuid.UUID], List[User]):
         with self.session_maker() as session:
-            results = session.query(UserModel).all()
-            return [r.to_record() for r in results]
+            query = session.query(UserModel).order_by(desc(UserModel.id))
+            if cursor:
+                query = query.filter(UserModel.id < cursor)
+            results = query.limit(limit).all()
+            if not results:
+                return None, []
+            user_records = [r.to_record() for r in results]
+            next_cursor = user_records[-1].id
+            assert isinstance(next_cursor, uuid.UUID)
+
+            return next_cursor, user_records
 
     @enforce_types
     def get_source(
@@ -604,6 +674,19 @@ class MetadataStore:
             assert len(results) == 1, f"Expected 1 result, got {len(results)}"
             return results[0].to_record()
 
+    @enforce_types
+    def get_tool(self, tool_name: str, user_id: Optional[uuid.UUID] = None) -> Optional[ToolModel]:
+        # TODO: add user_id when tools can eventually be added by users
+        with self.session_maker() as session:
+            results = session.query(ToolModel).filter(ToolModel.name == tool_name).filter(ToolModel.user_id == None).all()
+            if user_id:
+                results += session.query(ToolModel).filter(ToolModel.name == tool_name).filter(ToolModel.user_id == user_id).all()
+
+            if len(results) == 0:
+                return None
+            assert len(results) == 1, f"Expected 1 result, got {len(results)}"
+            return results[0]
+
     # agent source metadata
     @enforce_types
     def attach_source(self, user_id: uuid.UUID, agent_id: uuid.UUID, source_id: uuid.UUID):
@@ -615,13 +698,31 @@ class MetadataStore:
     def list_attached_sources(self, agent_id: uuid.UUID) -> List[uuid.UUID]:
         with self.session_maker() as session:
             results = session.query(AgentSourceMappingModel).filter(AgentSourceMappingModel.agent_id == agent_id).all()
-            return [r.source_id for r in results]
+
+            source_ids = []
+            # make sure source exists
+            for r in results:
+                source = self.get_source(source_id=r.source_id)
+                if source:
+                    source_ids.append(r.source_id)
+                else:
+                    printd(f"Warning: source {r.source_id} does not exist but exists in mapping database. This should never happen.")
+            return source_ids
 
     @enforce_types
     def list_attached_agents(self, source_id: uuid.UUID) -> List[uuid.UUID]:
         with self.session_maker() as session:
             results = session.query(AgentSourceMappingModel).filter(AgentSourceMappingModel.source_id == source_id).all()
-            return [r.agent_id for r in results]
+
+            agent_ids = []
+            # make sure agent exists
+            for r in results:
+                agent = self.get_agent(agent_id=r.agent_id)
+                if agent:
+                    agent_ids.append(r.agent_id)
+                else:
+                    printd(f"Warning: agent {r.agent_id} does not exist but exists in mapping database. This should never happen.")
+            return agent_ids
 
     @enforce_types
     def detach_source(self, agent_id: uuid.UUID, source_id: uuid.UUID):
@@ -634,19 +735,31 @@ class MetadataStore:
     @enforce_types
     def add_human(self, human: HumanModel):
         with self.session_maker() as session:
+            if self.get_human(human.name, human.user_id):
+                raise ValueError(f"Human with name {human.name} already exists for user_id {human.user_id}")
             session.add(human)
             session.commit()
 
     @enforce_types
     def add_persona(self, persona: PersonaModel):
         with self.session_maker() as session:
+            if self.get_persona(persona.name, persona.user_id):
+                raise ValueError(f"Persona with name {persona.name} already exists for user_id {persona.user_id}")
             session.add(persona)
             session.commit()
 
     @enforce_types
-    def add_preset(self, preset: PresetModel):
+    def add_preset(self, preset: PresetModel):  # TODO: remove
         with self.session_maker() as session:
             session.add(preset)
+            session.commit()
+
+    @enforce_types
+    def add_tool(self, tool: ToolModel):
+        with self.session_maker() as session:
+            if self.get_tool(tool.name, tool.user_id):
+                raise ValueError(f"Tool with name {tool.name} already exists for user_id {tool.user_id}")
+            session.add(tool)
             session.commit()
 
     @enforce_types
@@ -703,3 +816,37 @@ class MetadataStore:
         with self.session_maker() as session:
             session.query(PresetModel).filter(PresetModel.name == name).filter(PresetModel.user_id == user_id).delete()
             session.commit()
+
+    @enforce_types
+    def delete_tool(self, name: str, user_id: uuid.UUID):
+        with self.session_maker() as session:
+            session.query(ToolModel).filter(ToolModel.name == name).filter(ToolModel.user_id == user_id).delete()
+            session.commit()
+
+    # job related functions
+    def create_job(self, job: JobModel):
+        with self.session_maker() as session:
+            session.add(job)
+            session.commit()
+            session.expunge_all()
+
+    def update_job_status(self, job_id: uuid.UUID, status: JobStatus):
+        with self.session_maker() as session:
+            session.query(JobModel).filter(JobModel.id == job_id).update({"status": status})
+            if status == JobStatus.COMPLETED:
+                session.query(JobModel).filter(JobModel.id == job_id).update({"completed_at": get_utc_time()})
+            session.commit()
+
+    def update_job(self, job: JobModel):
+        with self.session_maker() as session:
+            session.add(job)
+            session.commit()
+            session.refresh(job)
+
+    def get_job(self, job_id: uuid.UUID) -> Optional[JobModel]:
+        with self.session_maker() as session:
+            results = session.query(JobModel).filter(JobModel.id == job_id).all()
+            if len(results) == 0:
+                return None
+            assert len(results) == 1, f"Expected 1 result, got {len(results)}"
+            return results[0]

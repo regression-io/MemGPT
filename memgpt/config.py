@@ -1,16 +1,17 @@
-from memgpt.log import logger
+import configparser
 import inspect
 import json
 import os
 import uuid
-from dataclasses import dataclass, field
-import configparser
+from dataclasses import dataclass
 
 import memgpt
 import memgpt.utils as utils
+from memgpt.constants import DEFAULT_HUMAN, DEFAULT_PERSONA, DEFAULT_PRESET, MEMGPT_DIR
+from memgpt.data_types import AgentState, EmbeddingConfig, LLMConfig
+from memgpt.log import get_logger
 
-from memgpt.constants import MEMGPT_DIR, DEFAULT_HUMAN, DEFAULT_PERSONA, DEFAULT_PRESET
-from memgpt.data_types import AgentState, LLMConfig, EmbeddingConfig
+logger = get_logger(__name__)
 
 
 # helper functions for writing to configs
@@ -37,17 +38,17 @@ class MemGPTConfig:
     anon_clientid: str = str(uuid.UUID(int=0))
 
     # preset
-    preset: str = DEFAULT_PRESET
+    preset: str = DEFAULT_PRESET  # TODO: rename to system prompt
 
     # persona parameters
     persona: str = DEFAULT_PERSONA
     human: str = DEFAULT_HUMAN
 
     # model parameters
-    default_llm_config: LLMConfig = field(default_factory=LLMConfig)
+    default_llm_config: LLMConfig = None
 
     # embedding parameters
-    default_embedding_config: EmbeddingConfig = field(default_factory=EmbeddingConfig)
+    default_embedding_config: EmbeddingConfig = None
 
     # database configs: archival
     archival_storage_type: str = "chroma"  # local, db
@@ -89,7 +90,8 @@ class MemGPTConfig:
     @classmethod
     def load(cls) -> "MemGPTConfig":
         # avoid circular import
-        from memgpt.migrate import config_is_compatible, VERSION_CUTOFF
+        from memgpt.migrate import VERSION_CUTOFF, config_is_compatible
+        from memgpt.utils import printd
 
         if not config_is_compatible(allow_empty=True):
             error_message = " ".join(
@@ -110,6 +112,7 @@ class MemGPTConfig:
 
         # insure all configuration directories exist
         cls.create_config_dir()
+        printd(f"Loading config from {config_path}")
         if os.path.exists(config_path):
             # read existing config
             config.read(config_path)
@@ -170,7 +173,6 @@ class MemGPTConfig:
                 "config_path": config_path,
                 "memgpt_version": get_field(config, "version", "memgpt_version"),
             }
-
             # Don't include null values
             config_dict = {k: v for k, v in config_dict.items() if v is not None}
 
@@ -179,6 +181,7 @@ class MemGPTConfig:
         # create new config
         anon_clientid = MemGPTConfig.generate_uuid()
         config = cls(anon_clientid=anon_clientid, config_path=config_path)
+
         config.create_config_dir()  # create dirs
 
         return config
@@ -271,6 +274,7 @@ class MemGPTConfig:
         with open(self.config_path, "w", encoding="utf-8") as f:
             config.write(f)
         logger.debug(f"Saved Config:  {self.config_path}")
+        print(f"Saved Config:  {self.config_path}")
 
     @staticmethod
     def exists():
@@ -339,10 +343,9 @@ class AgentConfig:
         # functions
         functions=None,  # schema definitions ONLY (linked at runtime)
     ):
-        if name is None:
-            self.name = f"agent_{self.generate_agent_id()}"
-        else:
-            self.name = name
+
+        assert name, f"Agent name must be provided"
+        self.name = name
 
         config = MemGPTConfig.load()  # get default values
         self.persona = config.persona if persona is None else persona
@@ -394,15 +397,6 @@ class AgentConfig:
         self.agent_config_path = (
             os.path.join(MEMGPT_DIR, "agents", self.name, "config.json") if agent_config_path is None else agent_config_path
         )
-
-    def generate_agent_id(self, length=6):
-        ## random character based
-        # characters = string.ascii_lowercase + string.digits
-        # return ''.join(random.choices(characters, k=length))
-
-        # count based
-        agent_count = len(utils.list_agent_config_files())
-        return str(agent_count + 1)
 
     def attach_data_source(self, data_source: str):
         # TODO: add warning that only once source can be attached

@@ -1,13 +1,17 @@
 import re
 import uuid
 from functools import partial
-
-from fastapi import APIRouter, Body, Depends, Query, HTTPException, status
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
 from typing import List, Optional
 
-from memgpt.models.pydantic_models import AgentStateModel, LLMConfigModel, EmbeddingConfigModel
+from fastapi import APIRouter, Body, Depends, HTTPException, status
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from memgpt.models.pydantic_models import (
+    AgentStateModel,
+    EmbeddingConfigModel,
+    LLMConfigModel,
+)
 from memgpt.server.rest_api.auth_token import get_current_user
 from memgpt.server.rest_api.interface import QueuingInterface
 from memgpt.server.server import SyncServer
@@ -75,14 +79,13 @@ def setup_agents_config_router(server: SyncServer, interface: QueuingInterface, 
                 id=agent_state.id,
                 name=agent_state.name,
                 user_id=agent_state.user_id,
-                preset=agent_state.preset,
-                persona=agent_state.persona,
-                human=agent_state.human,
                 llm_config=llm_config,
                 embedding_config=embedding_config,
                 state=agent_state.state,
                 created_at=int(agent_state.created_at.timestamp()),
-                functions_schema=agent_state.state["functions"],  # TODO: this is very error prone, jsut lookup the preset instead
+                tools=agent_state.tools,
+                system=agent_state.system,
+                metadata=agent_state._metadata,
             ),
             last_run_at=None,  # TODO
             sources=attached_sources,
@@ -120,14 +123,12 @@ def setup_agents_config_router(server: SyncServer, interface: QueuingInterface, 
                 id=agent_state.id,
                 name=agent_state.name,
                 user_id=agent_state.user_id,
-                preset=agent_state.preset,
-                persona=agent_state.persona,
-                human=agent_state.human,
                 llm_config=llm_config,
                 embedding_config=embedding_config,
                 state=agent_state.state,
                 created_at=int(agent_state.created_at.timestamp()),
-                functions_schema=agent_state.state["functions"],  # TODO: this is very error prone, jsut lookup the preset instead
+                tools=agent_state.tools,
+                system=agent_state.system,
             ),
             last_run_at=None,  # TODO
             sources=attached_sources,

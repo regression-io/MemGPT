@@ -11,7 +11,13 @@ from memgpt.server.server import SyncServer
 router = APIRouter()
 
 
+class GetAllUsersRequest(BaseModel):
+    cursor: Optional[uuid.UUID] = Field(None, description="Cursor to which to start the paginated request.")
+    limit: Optional[int] = Field(50, description="Maximum number of users to retrieve per page.")
+
+
 class GetAllUsersResponse(BaseModel):
+    cursor: Optional[uuid.UUID] = Field(None, description="Cursor for the next page in the response.")
     user_list: List[dict] = Field(..., description="A list of users.")
 
 
@@ -54,18 +60,18 @@ class DeleteUserResponse(BaseModel):
 
 def setup_admin_router(server: SyncServer, interface: QueuingInterface):
     @router.get("/users", tags=["admin"], response_model=GetAllUsersResponse)
-    def get_all_users():
+    def get_all_users(request: GetAllUsersRequest = Body(...)):
         """
         Get a list of all users in the database
         """
         try:
-            users = server.ms.get_all_users()
+            next_cursor, users = server.ms.get_all_users(request.cursor, request.limit)
             processed_users = [{"user_id": user.id} for user in users]
         except HTTPException:
             raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"{e}")
-        return GetAllUsersResponse(user_list=processed_users)
+        return GetAllUsersResponse(cursor=next_cursor, user_list=processed_users)
 
     @router.post("/users", tags=["admin"], response_model=CreateUserResponse)
     def create_user(request: Optional[CreateUserRequest] = Body(None)):
@@ -82,9 +88,6 @@ def setup_admin_router(server: SyncServer, interface: QueuingInterface):
 
         try:
             server.ms.create_user(new_user)
-
-            # initialize default presets automatically for user
-            server.initialize_default_presets(new_user.id)
 
             # make sure we can retrieve the user from the DB too
             new_user_ret = server.ms.get_user(new_user.id)
@@ -136,8 +139,9 @@ def setup_admin_router(server: SyncServer, interface: QueuingInterface):
         """
         Get a list of all API keys for a user
         """
-        print("GET USERS", user_id)
         try:
+            if server.ms.get_user(user_id=user_id) is None:
+                raise HTTPException(status_code=404, detail=f"User does not exist")
             tokens = server.ms.get_all_api_keys_for_user(user_id=user_id)
             processed_tokens = [t.token for t in tokens]
         except HTTPException:

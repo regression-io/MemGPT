@@ -1,32 +1,39 @@
-import uuid
 import json
-import requests
-import sys
 import logging
-from pathlib import Path
 import os
 import subprocess
+import sys
+import uuid
 from enum import Enum
+from pathlib import Path
 from typing import Annotated, Optional
 
-import typer
 import questionary
+import requests
+import typer
 
-from memgpt.log import logger
-from memgpt.interface import CLIInterface as interface  # for printing to terminal
-from memgpt.cli.cli_config import configure
-import memgpt.presets.presets as presets
 import memgpt.utils as utils
-from memgpt.utils import printd, open_folder_in_explorer, suppress_stdout
-from memgpt.config import MemGPTConfig
-from memgpt.credentials import MemGPTCredentials
-from memgpt.constants import MEMGPT_DIR, CLI_WARNING_PREFIX, JSON_ENSURE_ASCII
+from memgpt import create_client
 from memgpt.agent import Agent, save_agent
-from memgpt.embeddings import embedding_model
-from memgpt.server.constants import WS_DEFAULT_PORT, REST_DEFAULT_PORT
-from memgpt.data_types import AgentState, LLMConfig, EmbeddingConfig, User, Passage, Preset
+from memgpt.cli.cli_config import configure
+from memgpt.config import MemGPTConfig
+from memgpt.constants import CLI_WARNING_PREFIX, MEMGPT_DIR
+from memgpt.credentials import MemGPTCredentials
+from memgpt.data_types import EmbeddingConfig, LLMConfig, User
+from memgpt.log import get_logger
+from memgpt.memory import ChatMemory
 from memgpt.metadata import MetadataStore
 from memgpt.migrate import migrate_all_agents, migrate_all_sources
+from memgpt.server.constants import WS_DEFAULT_PORT
+from memgpt.server.server import logger as server_logger
+
+# from memgpt.interface import CLIInterface as interface  # for printing to terminal
+from memgpt.streaming_interface import (
+    StreamingRefreshCLIInterface as interface,  # for printing to terminal
+)
+from memgpt.utils import open_folder_in_explorer, printd
+
+logger = get_logger(__name__)
 
 
 def migrate(
@@ -75,27 +82,46 @@ def set_config_with_dict(new_config: dict) -> (MemGPTConfig, bool):
                 printd(f"Skipping new config {k}: {v} == {new_config[k]}")
 
     # update embedding config
-    for k, v in vars(old_config.default_embedding_config).items():
-        if k in new_config:
-            if v != new_config[k]:
-                printd(f"Replacing config {k}: {v} -> {new_config[k]}")
-                modified = True
-                # old_config[k] = new_config[k]
-                setattr(old_config.default_embedding_config, k, new_config[k])
-            else:
-                printd(f"Skipping new config {k}: {v} == {new_config[k]}")
+    if old_config.default_embedding_config:
+        for k, v in vars(old_config.default_embedding_config).items():
+            if k in new_config:
+                if v != new_config[k]:
+                    printd(f"Replacing config {k}: {v} -> {new_config[k]}")
+                    modified = True
+                    # old_config[k] = new_config[k]
+                    setattr(old_config.default_embedding_config, k, new_config[k])
+                else:
+                    printd(f"Skipping new config {k}: {v} == {new_config[k]}")
+    else:
+        modified = True
+        fields = ["embedding_model", "embedding_dim", "embedding_chunk_size", "embedding_endpoint", "embedding_endpoint_type"]
+        args = {}
+        for field in fields:
+            if field in new_config:
+                args[field] = new_config[field]
+                printd(f"Setting new config {field}: {new_config[field]}")
+        old_config.default_embedding_config = EmbeddingConfig(**args)
 
     # update llm config
-    for k, v in vars(old_config.default_llm_config).items():
-        if k in new_config:
-            if v != new_config[k]:
-                printd(f"Replacing config {k}: {v} -> {new_config[k]}")
-                modified = True
-                # old_config[k] = new_config[k]
-                setattr(old_config.default_llm_config, k, new_config[k])
-            else:
-                printd(f"Skipping new config {k}: {v} == {new_config[k]}")
-
+    if old_config.default_llm_config:
+        for k, v in vars(old_config.default_llm_config).items():
+            if k in new_config:
+                if v != new_config[k]:
+                    printd(f"Replacing config {k}: {v} -> {new_config[k]}")
+                    modified = True
+                    # old_config[k] = new_config[k]
+                    setattr(old_config.default_llm_config, k, new_config[k])
+                else:
+                    printd(f"Skipping new config {k}: {v} == {new_config[k]}")
+    else:
+        modified = True
+        fields = ["model", "model_endpoint", "model_endpoint_type", "model_wrapper", "context_window"]
+        args = {}
+        for field in fields:
+            if field in new_config:
+                args[field] = new_config[field]
+                printd(f"Setting new config {field}: {new_config[field]}")
+        old_config.default_llm_config = LLMConfig(**args)
     return (old_config, modified)
 
 
@@ -126,7 +152,7 @@ def quickstart(
         # fallback to using local
         if latest:
             # Download the latest memgpt hosted config
-            url = "https://raw.githubusercontent.com/cpacker/MemGPT/main/memgpt/configs/memgpt_hosted.json"
+            url = "https://raw.githubusercontent.com/cpacker/MemGPT/main/configs/memgpt_hosted.json"
             response = requests.get(url)
 
             # Check if the request was successful
@@ -153,10 +179,13 @@ def quickstart(
         else:
             # Load the file from the relative path
             script_dir = os.path.dirname(__file__)  # Get the directory where the script is located
+            # print("SCRIPT", script_dir)
             backup_config_path = os.path.join(script_dir, "..", "configs", "memgpt_hosted.json")
+            # print("FILE PATH", backup_config_path)
             try:
                 with open(backup_config_path, "r", encoding="utf-8") as file:
                     backup_config = json.load(file)
+                    # print(backup_config)
                 printd("Loaded config file successfully.")
                 new_config, config_was_modified = set_config_with_dict(backup_config)
             except FileNotFoundError:
@@ -175,7 +204,7 @@ def quickstart(
         # if latest, try to pull the config from the repo
         # fallback to using local
         if latest:
-            url = "https://raw.githubusercontent.com/cpacker/MemGPT/main/memgpt/configs/openai.json"
+            url = "https://raw.githubusercontent.com/cpacker/MemGPT/main/configs/openai.json"
             response = requests.get(url)
 
             # Check if the request was successful
@@ -288,22 +317,8 @@ def server(
 ):
     """Launch a MemGPT server process"""
 
-    # if debug:
-    #    from memgpt.server.server import logger as server_logger
-
-    #    # Set the logging level
-    #    server_logger.setLevel(logging.DEBUG)
-    #    # Create a StreamHandler
-    #    stream_handler = logging.StreamHandler()
-    #    # Set the formatter (optional)
-    #    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    #    stream_handler.setFormatter(formatter)
-    #    # Add the handler to the logger
-    #    server_logger.addHandler(stream_handler)
-
     if type == ServerChoice.rest_api:
-        import uvicorn
-        from memgpt.server.rest_api.server import app
+        pass
 
         if MemGPTConfig.exists():
             config = MemGPTConfig.load()
@@ -324,35 +339,6 @@ def server(
                 ssl_key=ssl_key,
                 debug=debug,
             )
-            # if use_ssl:
-            #    if ssl_cert is None:  # No certificate path provided, generate a self-signed certificate
-            #        ssl_certfile, ssl_keyfile = generate_self_signed_cert()
-            #        print(f"Running server with self-signed SSL cert: {ssl_certfile}, {ssl_keyfile}")
-            #    else:
-            #        ssl_certfile, ssl_keyfile = ssl_cert, ssl_key  # Assuming cert includes both
-            #        print(f"Running server with provided SSL cert: {ssl_certfile}, {ssl_keyfile}")
-
-            #    # This will start the server on HTTPS
-            #    assert isinstance(ssl_certfile, str) and os.path.exists(ssl_certfile), ssl_certfile
-            #    assert isinstance(ssl_keyfile, str) and os.path.exists(ssl_keyfile), ssl_keyfile
-            #    print(
-            #        f"Running: uvicorn {app}:app --host {host or 'localhost'} --port {port or REST_DEFAULT_PORT} --ssl-keyfile {ssl_keyfile} --ssl-certfile {ssl_certfile}"
-            #    )
-            #    uvicorn.run(
-            #        app,
-            #        host=host or "localhost",
-            #        port=port or REST_DEFAULT_PORT,
-            #        ssl_keyfile=ssl_keyfile,
-            #        ssl_certfile=ssl_certfile,
-            #    )
-            # else:
-            #    # Start the subprocess in a new session
-            #    print(f"Running: uvicorn {app}:app --host {host or 'localhost'} --port {port or REST_DEFAULT_PORT}")
-            #    uvicorn.run(
-            #        app,
-            #        host=host or "localhost",
-            #        port=port or REST_DEFAULT_PORT,
-            #    )
 
         except KeyboardInterrupt:
             # Handle CTRL-C
@@ -408,7 +394,6 @@ def run(
     persona: Annotated[Optional[str], typer.Option(help="Specify persona")] = None,
     agent: Annotated[Optional[str], typer.Option(help="Specify agent name")] = None,
     human: Annotated[Optional[str], typer.Option(help="Specify human")] = None,
-    preset: Annotated[Optional[str], typer.Option(help="Specify preset")] = None,
     # model flags
     model: Annotated[Optional[str], typer.Option(help="Specify the LLM model")] = None,
     model_wrapper: Annotated[Optional[str], typer.Option(help="Specify the LLM model wrapper")] = None,
@@ -423,6 +408,8 @@ def run(
     debug: Annotated[bool, typer.Option(help="Use --debug to enable debugging output")] = False,
     no_verify: Annotated[bool, typer.Option(help="Bypass message verification")] = False,
     yes: Annotated[bool, typer.Option("-y", help="Skip confirmation prompt and use defaults")] = False,
+    # streaming
+    stream: Annotated[bool, typer.Option(help="Enables message streaming in the CLI (if the backend supports it)")] = False,
 ):
     """Start chatting with an MemGPT agent
 
@@ -442,10 +429,16 @@ def run(
 
     if debug:
         logger.setLevel(logging.DEBUG)
+        server_logger.setLevel(logging.DEBUG)
     else:
         logger.setLevel(logging.CRITICAL)
+        server_logger.setLevel(logging.CRITICAL)
 
-    from memgpt.migrate import config_is_compatible, wipe_config_and_reconfigure, VERSION_CUTOFF
+    from memgpt.migrate import (
+        VERSION_CUTOFF,
+        config_is_compatible,
+        wipe_config_and_reconfigure,
+    )
 
     if not config_is_compatible(allow_empty=True):
         typer.secho(f"\nYour current config file is incompatible with MemGPT versions later than {VERSION_CUTOFF}\n", fg=typer.colors.RED)
@@ -519,17 +512,9 @@ def run(
     else:  # load config
         config = MemGPTConfig.load()
 
-        # force re-configuration is config is from old version
-        if config.memgpt_version is None:  # TODO: eventually add checks for older versions, if config changes again
-            typer.secho("MemGPT has been updated to a newer version, so re-running configuration.", fg=typer.colors.YELLOW)
-            configure()
-            config = MemGPTConfig.load()
-
     # read user id from config
     ms = MetadataStore(config)
     user = create_default_user_or_exit(config, ms)
-    human = human if human else config.human
-    persona = persona if persona else config.persona
 
     # determine agent to use, if not provided
     if not yes and not agent:
@@ -546,6 +531,8 @@ def run(
 
     # create agent config
     agent_state = ms.get_agent(agent_name=agent, user_id=user.id) if agent else None
+    human = human if human else config.human
+    persona = persona if persona else config.persona
     if agent and agent_state:  # use existing agent
         typer.secho(f"\n🔁 Using existing agent {agent}", fg=typer.colors.GREEN)
         # agent_config = AgentConfig.load(agent)
@@ -557,14 +544,6 @@ def run(
         # printd("Index path:", agent_config.save_agent_index_dir())
         # persistence_manager = LocalStateManager(agent_config).load() # TODO: implement load
         # TODO: load prior agent state
-        if persona and persona != agent_state.persona:
-            typer.secho(f"{CLI_WARNING_PREFIX}Overriding existing persona {agent_state.persona} with {persona}", fg=typer.colors.YELLOW)
-            agent_state.persona = persona
-            # raise ValueError(f"Cannot override {agent_state.name} existing persona {agent_state.persona} with {persona}")
-        if human and human != agent_state.human:
-            typer.secho(f"{CLI_WARNING_PREFIX}Overriding existing human {agent_state.human} with {human}", fg=typer.colors.YELLOW)
-            agent_state.human = human
-            # raise ValueError(f"Cannot override {agent_config.name} existing human {agent_config.human} with {human}")
 
         # Allow overriding model specifics (model, model wrapper, model endpoint IP + type, context_window)
         if model and model != agent_state.llm_config.model:
@@ -599,9 +578,15 @@ def run(
 
         # Update the agent with any overrides
         ms.update_agent(agent_state)
+        tools = []
+        for tool_name in agent_state.tools:
+            tool = ms.get_tool(tool_name, agent_state.user_id)
+            if tool is None:
+                typer.secho(f"Couldn't find tool {tool_name} in database, please run `memgpt add tool`", fg=typer.colors.RED)
+            tools.append(tool)
 
         # create agent
-        memgpt_agent = Agent(agent_state=agent_state, interface=interface())
+        memgpt_agent = Agent(agent_state=agent_state, interface=interface(), tools=tools)
 
     else:  # create new agent
         # create new agent config: override defaults with args if provided
@@ -642,51 +627,35 @@ def run(
 
         # create agent
         try:
-            preset_obj = ms.get_preset(name=preset if preset else config.preset, user_id=user.id)
-            preset_override = False
-            if preset_obj is None:
-                # create preset records in metadata store
-                from memgpt.presets.presets import add_default_presets
-
-                add_default_presets(user.id, ms)
-                # try again
-                preset_obj = ms.get_preset(name=preset if preset else config.preset, user_id=user.id)
-                if preset_obj is None:
-                    typer.secho("Couldn't find presets in database, please run `memgpt configure`", fg=typer.colors.RED)
-                    sys.exit(1)
-
+            client = create_client()
             human_obj = ms.get_human(human, user.id)
+            persona_obj = ms.get_persona(persona, user.id)
             if human_obj is None:
                 typer.secho("Couldn't find human {human} in database, please run `memgpt add human`", fg=typer.colors.RED)
-            persona_obj = ms.get_persona(persona, user.id)
             if persona_obj is None:
                 typer.secho("Couldn't find persona {persona} in database, please run `memgpt add persona`", fg=typer.colors.RED)
 
-            # Overwrite fields in the preset if they were specified
-            if human_obj.text != preset_obj.human:
-                preset_override = True
-                preset_obj.human = human_obj.text
-            if persona_obj.text != preset_obj.human:
-                preset_override = True
-                preset_obj.persona = persona_obj.text
+            memory = ChatMemory(human=human_obj.text, persona=persona_obj.text)
+            metadata = {"human": human_obj.name, "persona": persona_obj.name}
 
-            # If the user overrode any parts of the preset, we need to create a new preset to refer back to
-            if preset_override:
-                # Change the name and uuid
-                preset_obj = Preset.clone(preset_obj=preset_obj)
-                # Then write out to the database for storage
-                ms.create_preset(preset=preset_obj)
+            typer.secho(f"->  🤖 Using persona profile: '{persona_obj.name}'", fg=typer.colors.WHITE)
+            typer.secho(f"->  🧑 Using human profile: '{human_obj.name}'", fg=typer.colors.WHITE)
 
-            typer.secho(f"->  🤖 Using persona profile: '{preset_obj.persona_name}'", fg=typer.colors.WHITE)
-            typer.secho(f"->  🧑 Using human profile: '{preset_obj.human_name}'", fg=typer.colors.WHITE)
+            # add tools
+            agent_state = client.create_agent(
+                name=agent_name,
+                embedding_config=embedding_config,
+                llm_config=llm_config,
+                memory=memory,
+                metadata=metadata,
+            )
+            typer.secho(f"->  🛠️  {len(agent_state.tools)} tools: {', '.join([t for t in agent_state.tools])}", fg=typer.colors.WHITE)
+            tools = [ms.get_tool(tool_name, user_id=client.user_id) for tool_name in agent_state.tools]
 
             memgpt_agent = Agent(
                 interface=interface(),
-                name=agent_name,
-                created_by=user.id,
-                preset=preset_obj,
-                llm_config=llm_config,
-                embedding_config=embedding_config,
+                agent_state=agent_state,
+                tools=tools,
                 # gpt-3.5-turbo tends to omit inner monologue, relax this requirement for now
                 first_message_verify_mono=True if (model is not None and "gpt-4" in model) else False,
             )
@@ -701,7 +670,9 @@ def run(
     from memgpt.main import run_agent_loop
 
     print()  # extra space
-    run_agent_loop(memgpt_agent, config, first, ms, no_verify)  # TODO: add back no_verify
+    run_agent_loop(
+        memgpt_agent=memgpt_agent, config=config, first=first, ms=ms, no_verify=no_verify, stream=stream
+    )  # TODO: add back no_verify
 
 
 def delete_agent(

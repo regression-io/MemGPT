@@ -1,14 +1,18 @@
 import json
-import uvicorn
-from typing import Optional
 import logging
 import os
 import secrets
+import subprocess
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import typer
+import uvicorn
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from starlette.middleware.cors import CORSMiddleware
 
+from memgpt.server.constants import REST_DEFAULT_PORT
+from memgpt.server.rest_api.admin.tools import setup_tools_index_router
 from memgpt.server.rest_api.admin.users import setup_admin_router
 from memgpt.server.rest_api.agents.command import setup_agents_command_router
 from memgpt.server.rest_api.agents.config import setup_agents_config_router
@@ -18,18 +22,21 @@ from memgpt.server.rest_api.agents.message import setup_agents_message_router
 from memgpt.server.rest_api.auth.index import setup_auth_router
 from memgpt.server.rest_api.config.index import setup_config_index_router
 from memgpt.server.rest_api.humans.index import setup_humans_index_router
-from memgpt.server.rest_api.interface import QueuingInterface
+from memgpt.server.rest_api.interface import StreamingServerInterface
 from memgpt.server.rest_api.models.index import setup_models_index_router
-from memgpt.server.rest_api.openai_assistants.assistants import setup_openai_assistant_router
+from memgpt.server.rest_api.openai_assistants.assistants import (
+    setup_openai_assistant_router,
+)
+from memgpt.server.rest_api.openai_chat_completions.chat_completions import (
+    setup_openai_chat_completions_router,
+)
 from memgpt.server.rest_api.personas.index import setup_personas_index_router
-from memgpt.server.rest_api.static_files import mount_static_files
-from memgpt.server.rest_api.tools.index import setup_tools_index_router
-from memgpt.server.rest_api.sources.index import setup_sources_index_router
 from memgpt.server.rest_api.presets.index import setup_presets_index_router
+from memgpt.server.rest_api.sources.index import setup_sources_index_router
+from memgpt.server.rest_api.static_files import mount_static_files
+from memgpt.server.rest_api.tools.index import setup_user_tools_index_router
 from memgpt.server.server import SyncServer
-from memgpt.config import MemGPTConfig
-from memgpt.server.constants import REST_DEFAULT_PORT
-import subprocess
+from memgpt.settings import settings
 
 """
 Basic REST API sitting on top of the internal MemGPT python server (SyncServer)
@@ -39,20 +46,18 @@ Start the server with:
   poetry run uvicorn server:app --reload
 """
 
-interface: QueuingInterface = QueuingInterface()
-server: SyncServer = SyncServer(default_interface=interface)
+# interface: QueuingInterface = QueuingInterface()
+# interface: StreamingServerInterface = StreamingServerInterface()
+interface: StreamingServerInterface = StreamingServerInterface
+server: SyncServer = SyncServer(default_interface_factory=lambda: interface())
 
-
-SERVER_PASS_VAR = "MEMGPT_SERVER_PASS"
-password = os.getenv(SERVER_PASS_VAR)
-
-if password:
+if password := settings.server_pass:
     # if the pass was specified in the environment, use it
     print(f"Using existing admin server password from environment.")
 else:
     # Autogenerate a password for this session and dump it to stdout
     password = secrets.token_urlsafe(16)
-    print(f"Generated admin server password for this session: {password}")
+    typer.secho(f"Generated admin server password for this session: {password}", fg=typer.colors.GREEN)
 
 security = HTTPBearer()
 
@@ -67,20 +72,11 @@ ADMIN_PREFIX = "/admin"
 API_PREFIX = "/api"
 OPENAI_API_PREFIX = "/v1"
 
-CORS_ORIGINS = [
-    "http://localhost:4200",
-    "http://localhost:4201",
-    "http://localhost:8283",
-    "http://127.0.0.1:4200",
-    "http://127.0.0.1:4201",
-    "http://127.0.0.1:8283",
-]
-
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -91,6 +87,7 @@ app.include_router(setup_auth_router(server, interface, password), prefix=API_PR
 
 # /admin/users endpoints
 app.include_router(setup_admin_router(server, interface), prefix=ADMIN_PREFIX, dependencies=[Depends(verify_password)])
+app.include_router(setup_tools_index_router(server, interface), prefix=ADMIN_PREFIX, dependencies=[Depends(verify_password)])
 
 # /api/agents endpoints
 app.include_router(setup_agents_command_router(server, interface, password), prefix=API_PREFIX)
@@ -101,7 +98,7 @@ app.include_router(setup_agents_message_router(server, interface, password), pre
 app.include_router(setup_humans_index_router(server, interface, password), prefix=API_PREFIX)
 app.include_router(setup_personas_index_router(server, interface, password), prefix=API_PREFIX)
 app.include_router(setup_models_index_router(server, interface, password), prefix=API_PREFIX)
-app.include_router(setup_tools_index_router(server, interface, password), prefix=API_PREFIX)
+app.include_router(setup_user_tools_index_router(server, interface, password), prefix=API_PREFIX)
 app.include_router(setup_sources_index_router(server, interface, password), prefix=API_PREFIX)
 app.include_router(setup_presets_index_router(server, interface, password), prefix=API_PREFIX)
 
@@ -110,6 +107,9 @@ app.include_router(setup_config_index_router(server, interface, password), prefi
 
 # /v1/assistants endpoints
 app.include_router(setup_openai_assistant_router(server, interface), prefix=OPENAI_API_PREFIX)
+
+# /v1/chat/completions endpoints
+app.include_router(setup_openai_chat_completions_router(server, interface, password), prefix=OPENAI_API_PREFIX)
 
 # / static files
 mount_static_files(app)
@@ -122,19 +122,14 @@ def on_startup():
         app.openapi_schema = app.openapi()
 
     if app.openapi_schema:
-        app.openapi_schema["servers"] = [{"url": "http://localhost:8283"}]
+        app.openapi_schema["servers"] = [{"url": host} for host in settings.cors_origins]
         app.openapi_schema["info"]["title"] = "MemGPT API"
-
-    # Write out the OpenAPI schema to a file
-    # with open("openapi.json", "w") as file:
-    #     print(f"Writing out openapi.json file")
-    #     json.dump(app.openapi_schema, file, indent=2)
 
     # Split the API docs into MemGPT API, and OpenAI Assistants compatible API
     memgpt_api = app.openapi_schema.copy()
     memgpt_api["paths"] = {key: value for key, value in memgpt_api["paths"].items() if not key.startswith(OPENAI_API_PREFIX)}
     memgpt_api["info"]["title"] = "MemGPT API"
-    with open("openapi_memgpt.json", "w") as file:
+    with open("openapi_memgpt.json", "w", encoding="utf-8") as file:
         print(f"Writing out openapi_memgpt.json file")
         json.dump(memgpt_api, file, indent=2)
 
@@ -145,7 +140,7 @@ def on_startup():
         if not (key.startswith(API_PREFIX) or key.startswith(ADMIN_PREFIX))
     }
     openai_assistants_api["info"]["title"] = "OpenAI Assistants API"
-    with open("openapi_assistants.json", "w") as file:
+    with open("openapi_assistants.json", "w", encoding="utf-8") as file:
         print(f"Writing out openapi_assistants.json file")
         json.dump(openai_assistants_api, file, indent=2)
 

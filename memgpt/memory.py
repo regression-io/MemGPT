@@ -1,117 +1,249 @@
-from abc import ABC, abstractmethod
 import datetime
 import uuid
-from typing import Optional, List, Tuple, Union
+from abc import ABC, abstractmethod
+from typing import List, Optional, Tuple, Union
 
-from memgpt.constants import MESSAGE_SUMMARY_WARNING_FRAC
-from memgpt.utils import get_local_time, printd, count_tokens, validate_date_format, extract_date_from_timestamp
+from pydantic import BaseModel, validator
+
+from memgpt.constants import MESSAGE_SUMMARY_REQUEST_ACK, MESSAGE_SUMMARY_WARNING_FRAC
+from memgpt.data_types import AgentState, Message, Passage
+from memgpt.embeddings import embedding_model, parse_and_chunk_text, query_embedding
+from memgpt.llm_api.llm_api_tools import create
 from memgpt.prompts.gpt_summarize import SYSTEM as SUMMARY_PROMPT_SYSTEM
-from memgpt.llm_api_tools import create
-from memgpt.data_types import Message, Passage, AgentState
-from memgpt.embeddings import embedding_model, query_embedding, parse_and_chunk_text
+from memgpt.utils import (
+    count_tokens,
+    extract_date_from_timestamp,
+    get_local_time,
+    printd,
+    validate_date_format,
+)
 
-# from llama_index import Document
-# from llama_index.node_parser import SimpleNodeParser
+
+class MemoryModule(BaseModel):
+    """Base class for memory modules"""
+
+    description: Optional[str] = None
+    limit: int = 2000
+    value: Optional[Union[List[str], str]] = None
+
+    def __setattr__(self, name, value):
+        """Run validation if self.value is updated"""
+        super().__setattr__(name, value)
+        if name == "value":
+            # run validation
+            self.__class__.validate(self.dict(exclude_unset=True))
+
+    @validator("value", always=True)
+    def check_value_length(cls, v, values):
+        if v is not None:
+            # Fetching the limit from the values dictionary
+            limit = values.get("limit", 2000)  # Default to 2000 if limit is not yet set
+
+            # Check if the value exceeds the limit
+            if isinstance(v, str):
+                length = len(v)
+            elif isinstance(v, list):
+                length = sum(len(item) for item in v)
+            else:
+                raise ValueError("Value must be either a string or a list of strings.")
+
+            if length > limit:
+                error_msg = f"Edit failed: Exceeds {limit} character limit (requested {length})."
+                # TODO: add archival memory error?
+                raise ValueError(error_msg)
+        return v
+
+    def __len__(self):
+        return len(str(self))
+
+    def __str__(self) -> str:
+        if isinstance(self.value, list):
+            return ",".join(self.value)
+        elif isinstance(self.value, str):
+            return self.value
+        else:
+            return ""
 
 
-class CoreMemory(object):
-    """Held in-context inside the system message
+class BaseMemory:
 
-    Core Memory: Refers to the system block, which provides essential, foundational context to the AI.
-    This includes the persona information, essential user details,
-    and any other baseline data you deem necessary for the AI's basic functioning.
-    """
-
-    def __init__(self, persona=None, human=None, persona_char_limit=None, human_char_limit=None, archival_memory_exists=True):
-        self.persona = persona
-        self.human = human
-        self.persona_char_limit = persona_char_limit
-        self.human_char_limit = human_char_limit
-
-        # affects the error message the AI will see on overflow inserts
-        self.archival_memory_exists = archival_memory_exists
-
-    def __repr__(self) -> str:
-        return f"\n### CORE MEMORY ###" + f"\n=== Persona ===\n{self.persona}" + f"\n\n=== Human ===\n{self.human}"
-
-    def to_dict(self):
-        return {
-            "persona": self.persona,
-            "human": self.human,
-        }
+    def __init__(self):
+        self.memory = {}
 
     @classmethod
-    def load(cls, state):
-        return cls(state["persona"], state["human"])
+    def load(cls, state: dict):
+        """Load memory from dictionary object"""
+        obj = cls()
+        for key, value in state.items():
+            obj.memory[key] = MemoryModule(**value)
+        return obj
 
-    def edit_persona(self, new_persona):
-        if self.persona_char_limit and len(new_persona) > self.persona_char_limit:
-            error_msg = f"Edit failed: Exceeds {self.persona_char_limit} character limit (requested {len(new_persona)})."
-            if self.archival_memory_exists:
-                error_msg = f"{error_msg} Consider summarizing existing core memories in 'persona' and/or moving lower priority content to archival memory to free up space in core memory, then trying again."
-            raise ValueError(error_msg)
+    def __str__(self) -> str:
+        """Representation of the memory in-context"""
+        section_strs = []
+        for section, module in self.memory.items():
+            section_strs.append(f'<{section} characters="{len(module)}/{module.limit}">\n{module.value}\n</{section}>')
+        return "\n".join(section_strs)
 
-        self.persona = new_persona
-        return len(self.persona)
+    def to_dict(self):
+        """Convert to dictionary representation"""
+        return {key: value.dict() for key, value in self.memory.items()}
 
-    def edit_human(self, new_human):
-        if self.human_char_limit and len(new_human) > self.human_char_limit:
-            error_msg = f"Edit failed: Exceeds {self.human_char_limit} character limit (requested {len(new_human)})."
-            if self.archival_memory_exists:
-                error_msg = f"{error_msg} Consider summarizing existing core memories in 'human' and/or moving lower priority content to archival memory to free up space in core memory, then trying again."
-            raise ValueError(error_msg)
 
-        self.human = new_human
-        return len(self.human)
+class ChatMemory(BaseMemory):
 
-    def edit(self, field, content):
-        if field == "persona":
-            return self.edit_persona(content)
-        elif field == "human":
-            return self.edit_human(content)
-        else:
-            raise KeyError(f'No memory section named {field} (must be either "persona" or "human")')
+    def __init__(self, persona: str, human: str, limit: int = 2000):
+        self.memory = {
+            "persona": MemoryModule(name="persona", value=persona, limit=limit),
+            "human": MemoryModule(name="human", value=human, limit=limit),
+        }
 
-    def edit_append(self, field, content, sep="\n"):
-        if field == "persona":
-            new_content = self.persona + sep + content
-            return self.edit_persona(new_content)
-        elif field == "human":
-            new_content = self.human + sep + content
-            return self.edit_human(new_content)
-        else:
-            raise KeyError(f'No memory section named {field} (must be either "persona" or "human")')
+    def core_memory_append(self, name: str, content: str) -> Optional[str]:
+        """
+        Append to the contents of core memory.
 
-    def edit_replace(self, field, old_content, new_content):
-        if len(old_content) == 0:
-            raise ValueError("old_content cannot be an empty string (must specify old_content to replace)")
+        Args:
+            name (str): Section of the memory to be edited (persona or human).
+            content (str): Content to write to the memory. All unicode (including emojis) are supported.
 
-        if field == "persona":
-            if old_content in self.persona:
-                new_persona = self.persona.replace(old_content, new_content)
-                return self.edit_persona(new_persona)
-            else:
-                raise ValueError("Content not found in persona (make sure to use exact string)")
-        elif field == "human":
-            if old_content in self.human:
-                new_human = self.human.replace(old_content, new_content)
-                return self.edit_human(new_human)
-            else:
-                raise ValueError("Content not found in human (make sure to use exact string)")
-        else:
-            raise KeyError(f'No memory section named {field} (must be either "persona" or "human")')
+        Returns:
+            Optional[str]: None is always returned as this function does not produce a response.
+        """
+        self.memory[name].value += "\n" + content
+        return None
+
+    def core_memory_replace(self, name: str, old_content: str, new_content: str) -> Optional[str]:
+        """
+        Replace the contents of core memory. To delete memories, use an empty string for new_content.
+
+        Args:
+            name (str): Section of the memory to be edited (persona or human).
+            old_content (str): String to replace. Must be an exact match.
+            new_content (str): Content to write to the memory. All unicode (including emojis) are supported.
+
+        Returns:
+            Optional[str]: None is always returned as this function does not produce a response.
+        """
+        self.memory[name].value = self.memory[name].value.replace(old_content, new_content)
+        return None
+
+
+def get_memory_functions(cls: BaseMemory) -> List[callable]:
+    """Get memory functions for a memory class"""
+    functions = {}
+    for func_name in dir(cls):
+        if func_name.startswith("_") or func_name in ["load", "to_dict"]:  # skip base functions
+            continue
+        func = getattr(cls, func_name)
+        if callable(func):
+            functions[func_name] = func
+    return functions
+
+
+# class CoreMemory(object):
+#    """Held in-context inside the system message
+#
+#    Core Memory: Refers to the system block, which provides essential, foundational context to the AI.
+#    This includes the persona information, essential user details,
+#    and any other baseline data you deem necessary for the AI's basic functioning.
+#    """
+#
+#    def __init__(self, persona=None, human=None, persona_char_limit=None, human_char_limit=None, archival_memory_exists=True):
+#        self.persona = persona
+#        self.human = human
+#        self.persona_char_limit = persona_char_limit
+#        self.human_char_limit = human_char_limit
+#
+#        # affects the error message the AI will see on overflow inserts
+#        self.archival_memory_exists = archival_memory_exists
+#
+#    def __repr__(self) -> str:
+#        return f"\n### CORE MEMORY ###" + f"\n=== Persona ===\n{self.persona}" + f"\n\n=== Human ===\n{self.human}"
+#
+#    def to_dict(self):
+#        return {
+#            "persona": self.persona,
+#            "human": self.human,
+#        }
+#
+#    @classmethod
+#    def load(cls, state):
+#        return cls(state["persona"], state["human"])
+#
+#    def edit_persona(self, new_persona):
+#        if self.persona_char_limit and len(new_persona) > self.persona_char_limit:
+#            error_msg = f"Edit failed: Exceeds {self.persona_char_limit} character limit (requested {len(new_persona)})."
+#            if self.archival_memory_exists:
+#                error_msg = f"{error_msg} Consider summarizing existing core memories in 'persona' and/or moving lower priority content to archival memory to free up space in core memory, then trying again."
+#            raise ValueError(error_msg)
+#
+#        self.persona = new_persona
+#        return len(self.persona)
+#
+#    def edit_human(self, new_human):
+#        if self.human_char_limit and len(new_human) > self.human_char_limit:
+#            error_msg = f"Edit failed: Exceeds {self.human_char_limit} character limit (requested {len(new_human)})."
+#            if self.archival_memory_exists:
+#                error_msg = f"{error_msg} Consider summarizing existing core memories in 'human' and/or moving lower priority content to archival memory to free up space in core memory, then trying again."
+#            raise ValueError(error_msg)
+#
+#        self.human = new_human
+#        return len(self.human)
+#
+#    def edit(self, field, content):
+#        if field == "persona":
+#            return self.edit_persona(content)
+#        elif field == "human":
+#            return self.edit_human(content)
+#        else:
+#            raise KeyError(f'No memory section named {field} (must be either "persona" or "human")')
+#
+#    def edit_append(self, field, content, sep="\n"):
+#        if field == "persona":
+#            new_content = self.persona + sep + content
+#            return self.edit_persona(new_content)
+#        elif field == "human":
+#            new_content = self.human + sep + content
+#            return self.edit_human(new_content)
+#        else:
+#            raise KeyError(f'No memory section named {field} (must be either "persona" or "human")')
+#
+#    def edit_replace(self, field, old_content, new_content):
+#        if len(old_content) == 0:
+#            raise ValueError("old_content cannot be an empty string (must specify old_content to replace)")
+#
+#        if field == "persona":
+#            if old_content in self.persona:
+#                new_persona = self.persona.replace(old_content, new_content)
+#                return self.edit_persona(new_persona)
+#            else:
+#                raise ValueError("Content not found in persona (make sure to use exact string)")
+#        elif field == "human":
+#            if old_content in self.human:
+#                new_human = self.human.replace(old_content, new_content)
+#                return self.edit_human(new_human)
+#            else:
+#                raise ValueError("Content not found in human (make sure to use exact string)")
+#        else:
+#            raise KeyError(f'No memory section named {field} (must be either "persona" or "human")')
+
+
+def _format_summary_history(message_history: List[Message]):
+    # TODO use existing prompt formatters for this (eg ChatML)
+    return "\n".join([f"{m.role}: {m.text}" for m in message_history])
 
 
 def summarize_messages(
     agent_state: AgentState,
-    message_sequence_to_summarize,
+    message_sequence_to_summarize: List[Message],
+    insert_acknowledgement_assistant_message: bool = True,
 ):
     """Summarize a message sequence using GPT"""
     # we need the context_window
     context_window = agent_state.llm_config.context_window
 
     summary_prompt = SUMMARY_PROMPT_SYSTEM
-    summary_input = str(message_sequence_to_summarize)
+    summary_input = _format_summary_history(message_sequence_to_summarize)
     summary_input_tkns = count_tokens(summary_input)
     if summary_input_tkns > MESSAGE_SUMMARY_WARNING_FRAC * context_window:
         trunc_ratio = (MESSAGE_SUMMARY_WARNING_FRAC * context_window / summary_input_tkns) * 0.8  # For good measure...
@@ -120,13 +252,18 @@ def summarize_messages(
             [summarize_messages(agent_state, message_sequence_to_summarize=message_sequence_to_summarize[:cutoff])]
             + message_sequence_to_summarize[cutoff:]
         )
-    message_sequence = [
-        {"role": "system", "content": summary_prompt},
-        {"role": "user", "content": summary_input},
-    ]
+
+    dummy_user_id = uuid.uuid4()
+    dummy_agent_id = uuid.uuid4()
+    message_sequence = []
+    message_sequence.append(Message(user_id=dummy_user_id, agent_id=dummy_agent_id, role="system", text=summary_prompt))
+    if insert_acknowledgement_assistant_message:
+        message_sequence.append(Message(user_id=dummy_user_id, agent_id=dummy_agent_id, role="assistant", text=MESSAGE_SUMMARY_REQUEST_ACK))
+    message_sequence.append(Message(user_id=dummy_user_id, agent_id=dummy_agent_id, role="user", text=summary_input))
 
     response = create(
-        agent_state=agent_state,
+        llm_config=agent_state.llm_config,
+        user_id=agent_state.user_id,
         messages=message_sequence,
     )
 
@@ -310,12 +447,12 @@ class BaseRecallMemory(RecallMemory):
 
     def text_search(self, query_string, count=None, start=None):
         results = self.storage.query_text(query_string, count, start)
-        results_json = [message.to_openai_dict() for message in results]
+        results_json = [message.to_openai_dict_search_results() for message in results]
         return results_json, len(results)
 
     def date_search(self, start_date, end_date, count=None, start=None):
         results = self.storage.query_date(start_date, end_date, count, start)
-        results_json = [message.to_openai_dict() for message in results]
+        results_json = [message.to_openai_dict_search_results() for message in results]
         return results_json, len(results)
 
     def __repr__(self) -> str:
@@ -360,7 +497,6 @@ class EmbeddingArchivalMemory(ArchivalMemory):
         :type archival_memory_database: str
         """
         from memgpt.agent_store.storage import StorageConnector
-        from memgpt.config import MemGPTConfig
 
         self.top_k = top_k
         self.agent_state = agent_state

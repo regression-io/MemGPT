@@ -1,93 +1,16 @@
-import uuid
-import os
-import time
 import threading
-from dotenv import load_dotenv
-
-from memgpt import Admin, create_client
-from memgpt.constants import DEFAULT_PRESET
-from dotenv import load_dotenv
-
-from tests.config import TestMGPTConfig
-
-from memgpt.server.rest_api.server import start_server
-from memgpt.credentials import MemGPTCredentials
-from memgpt.data_types import EmbeddingConfig, LLMConfig
-from .utils import wipe_config, wipe_memgpt_home
-
+import time
+import uuid
 
 import pytest
-import uuid
+
+from memgpt import Admin
+from tests.test_client import _reset_config, run_server
 
 test_base_url = "http://localhost:8283"
 
 # admin credentials
 test_server_token = "test_server_token"
-
-
-def run_server():
-    import uvicorn
-    from memgpt.server.rest_api.server import app
-
-    load_dotenv()
-
-    # Use os.getenv with a fallback to os.environ.get
-    db_url = os.getenv("PGVECTOR_TEST_DB_URL") or os.environ.get("PGVECTOR_TEST_DB_URL")
-    assert db_url, "Missing PGVECTOR_TEST_DB_URL"
-
-    if os.getenv("OPENAI_API_KEY"):
-        config = TestMGPTConfig(
-            archival_storage_uri=db_url,
-            recall_storage_uri=db_url,
-            metadata_storage_uri=db_url,
-            archival_storage_type="postgres",
-            recall_storage_type="postgres",
-            metadata_storage_type="postgres",
-            # embeddings
-            default_embedding_config=EmbeddingConfig(
-                embedding_endpoint_type="openai",
-                embedding_endpoint="https://api.openai.com/v1",
-                embedding_dim=1536,
-            ),
-            # llms
-            default_llm_config=LLMConfig(
-                model_endpoint_type="openai",
-                model_endpoint="https://api.openai.com/v1",
-                model="gpt-4",
-            ),
-        )
-        credentials = MemGPTCredentials(
-            openai_key=os.getenv("OPENAI_API_KEY"),
-        )
-    else:  # hosted
-        config = TestMGPTConfig(
-            archival_storage_uri=db_url,
-            recall_storage_uri=db_url,
-            metadata_storage_uri=db_url,
-            archival_storage_type="postgres",
-            recall_storage_type="postgres",
-            metadata_storage_type="postgres",
-            # embeddings
-            default_embedding_config=EmbeddingConfig(
-                embedding_endpoint_type="hugging-face",
-                embedding_endpoint="https://embeddings.memgpt.ai",
-                embedding_model="BAAI/bge-large-en-v1.5",
-                embedding_dim=1024,
-            ),
-            # llms
-            default_llm_config=LLMConfig(
-                model_endpoint_type="vllm",
-                model_endpoint="https://api.memgpt.ai",
-                model="ehartford/dolphin-2.5-mixtral-8x7b",
-            ),
-        )
-        credentials = MemGPTCredentials()
-
-    config.save()
-    credentials.save()
-
-    # start server
-    start_server(debug=True)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -111,6 +34,8 @@ def admin_client():
 
 
 def test_admin_client(admin_client):
+    _reset_config()
+
     # create a user
     user_id = uuid.uuid4()
     create_user1_response = admin_client.create_user(user_id)
@@ -133,19 +58,17 @@ def test_admin_client(admin_client):
 
     # list keys
     user1_keys = admin_client.get_keys(user_id)
-    assert len(user1_keys.api_key_list) == 2, f"Expected 2 keys, got {user1_keys}"
-    assert create_key1_response.api_key in user1_keys.api_key_list, f"Expected {create_key1_response.api_key} in {user1_keys.api_key_list}"
-    assert (
-        create_user1_response.api_key in user1_keys.api_key_list
-    ), f"Expected {create_user1_response.api_key} in {user1_keys.api_key_list}"
+    assert len(user1_keys) == 2, f"Expected 2 keys, got {user1_keys}"
+    assert create_key1_response.api_key in user1_keys, f"Expected {create_key1_response.api_key} in {user1_keys}"
+    assert create_user1_response.api_key in user1_keys, f"Expected {create_user1_response.api_key} in {user1_keys}"
 
     # delete key
     delete_key1_response = admin_client.delete_key(create_key1_response.api_key)
     assert delete_key1_response.api_key_deleted == create_key1_response.api_key
-    assert len(admin_client.get_keys(user_id).api_key_list) == 1
+    assert len(admin_client.get_keys(user_id)) == 1
     delete_key2_response = admin_client.delete_key(create_key2_response.api_key)
     assert delete_key2_response.api_key_deleted == create_key2_response.api_key
-    assert len(admin_client.get_keys(create_user_2_response.user_id).api_key_list) == 1
+    assert len(admin_client.get_keys(create_user_2_response.user_id)) == 1
 
     # delete users
     delete_user1_response = admin_client.delete_user(user_id)
@@ -156,3 +79,54 @@ def test_admin_client(admin_client):
     # list users
     users = admin_client.get_users()
     assert len(users.user_list) == 0, f"Expected 0 users, got {users}"
+
+
+def test_get_users_pagination(admin_client):
+    _reset_config()
+
+    page_size = 5
+    num_users = 7
+    expected_users_remainder = num_users - page_size
+
+    # create users
+    all_user_ids = []
+    for i in range(num_users):
+
+        user_id = uuid.uuid4()
+        all_user_ids.append(user_id)
+        key_name = "test_key" + f"{i}"
+
+        create_user_response = admin_client.create_user(user_id)
+        admin_client.create_key(create_user_response.user_id, key_name)
+
+    # list users in page 1
+    get_all_users_response1 = admin_client.get_users(limit=page_size)
+    cursor1 = get_all_users_response1.cursor
+    user_list1 = get_all_users_response1.user_list
+    assert len(user_list1) == page_size
+
+    # list users in page 2 using cursor
+    get_all_users_response2 = admin_client.get_users(cursor1, limit=page_size)
+    cursor2 = get_all_users_response2.cursor
+    user_list2 = get_all_users_response2.user_list
+
+    assert len(user_list2) == expected_users_remainder
+    assert cursor1 != cursor2
+
+    # delete users
+    clean_up_users_and_keys(all_user_ids)
+
+    # list users to check pagination with no users
+    users = admin_client.get_users()
+    assert len(users.user_list) == 0, f"Expected 0 users, got {users}"
+
+
+def clean_up_users_and_keys(user_id_list):
+    admin_client = Admin(test_base_url, test_server_token)
+
+    # clean up all keys and users
+    for user_id in user_id_list:
+        keys_list = admin_client.get_keys(user_id)
+        for key in keys_list:
+            admin_client.delete_key(key)
+        admin_client.delete_user(user_id)

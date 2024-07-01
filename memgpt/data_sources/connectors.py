@@ -1,12 +1,12 @@
-from memgpt.data_types import Passage, Document, EmbeddingConfig, Source
-from memgpt.utils import create_uuid_from_string
-from memgpt.agent_store.storage import StorageConnector, TableType
-from memgpt.embeddings import embedding_model
-from memgpt.data_types import Document, Passage
+from typing import Dict, Iterator, List, Optional, Tuple
 
-from typing import List, Iterator, Dict, Tuple, Optional
 import typer
 from llama_index.core import Document as LlamaIndexDocument
+
+from memgpt.agent_store.storage import StorageConnector
+from memgpt.data_types import Document, EmbeddingConfig, Passage, Source
+from memgpt.embeddings import embedding_model
+from memgpt.utils import create_uuid_from_string
 
 
 class DataConnector:
@@ -37,6 +37,7 @@ def load_data(
 
     # insert passages/documents
     passages = []
+    embedding_to_document_name = {}
     passage_count = 0
     document_count = 0
     for document_text, document_metadata in connector.generate_documents():
@@ -54,6 +55,16 @@ def load_data(
 
         # generate passages
         for passage_text, passage_metadata in connector.generate_passages([document], chunk_size=embedding_config.embedding_chunk_size):
+
+            # for some reason, llama index parsers sometimes return empty strings
+            if len(passage_text) == 0:
+                typer.secho(
+                    f"Warning: Llama index parser returned empty string, skipping insert of passage with metadata '{passage_metadata}' into VectorDB. You can usually ignore this warning.",
+                    fg=typer.colors.YELLOW,
+                )
+                continue
+
+            # get embedding
             try:
                 embedding = embed_model.get_text_embedding(passage_text)
             except Exception as e:
@@ -75,8 +86,18 @@ def load_data(
                 embedding=embedding,
             )
 
+            hashable_embedding = tuple(passage.embedding)
+            document_name = document.metadata.get("file_path", document.id)
+            if hashable_embedding in embedding_to_document_name:
+                typer.secho(
+                    f"Warning: Duplicate embedding found for passage in {document_name} (already exists in {embedding_to_document_name[hashable_embedding]}), skipping insert into VectorDB.",
+                    fg=typer.colors.YELLOW,
+                )
+                continue
+
             passages.append(passage)
-            if len(passages) >= embedding_config.embedding_chunk_size:
+            embedding_to_document_name[hashable_embedding] = document_name
+            if len(passages) >= 100:
                 # insert passages into passage store
                 passage_store.insert_many(passages)
 
@@ -181,8 +202,8 @@ class VectorDBConnector(DataConnector):
         yield self.table_name, None
 
     def generate_passages(self, documents: List[Document], chunk_size: int = 1024) -> Iterator[Tuple[str, Dict]]:  # -> Iterator[Passage]:
-        from sqlalchemy import select, MetaData, Table, Inspector
         from pgvector.sqlalchemy import Vector
+        from sqlalchemy import Inspector, MetaData, Table, select
 
         metadata = MetaData()
         # Create an inspector to inspect the database
